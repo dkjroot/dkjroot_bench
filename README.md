@@ -57,10 +57,11 @@ one, two or three spaces along one axis, and each agent gets one tool call
 per turn. The cards beside the play area show each agent's latest view
 and the messages they've sent and received.
 
-Word Jumble gives a single agent a set of shuffled words. It can read the list
-and submit an answer. The initials of the words in the original sentence spell
-the answer, which scores 1 when submitted. The viewer shows each attempt and
-its feedback, then reveals the sentence when the agent gets it right.
+Word Jumble gives one agent ten puzzles in a row. In the first, the initials
+of the words in the original sentence spell the answer. The next nine are
+shuffled cryptic crossword clues. Each correct answer unlocks the next puzzle
+and adds 0.1 to the score. The viewer shows the submissions and feedback as
+they happen, then reveals each solved clue and how it works.
 
 ## Try it with a model
 
@@ -102,11 +103,14 @@ stop the viewer.
 
 ## Look back through the runs
 
-Each run gets a summary and a replay in `runs/`. The summary records the seed,
-model and provider, elapsed time, time to solve if it did, and token counts and
-USD cost reported by OpenRouter. If a request comes back without usage for
-a metric, the viewer leaves that total blank. It includes requests already sent
-during the winning round in the totals.
+Each run gets a `summary.json` and a `frames.jsonl` replay in its own folder
+under `runs/`. You can reopen it with `python3 bench.py --serve` without an
+API key or another model call. Keep a copy of `runs/` if you want to move the
+recordings to another machine. The summary records the seed, model and
+provider, elapsed time, time to solve, and token counts and USD cost reported
+by OpenRouter. If a request comes back without usage for a metric, the viewer
+leaves that total blank. Requests already sent during the winning round count
+towards the totals.
 
 Glass Tic-Tac-Toe scores from 0 to 1. Each wrong or missing square relative to
 the closest legal X win costs 0.2, down to zero. A square holding more than

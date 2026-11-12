@@ -56,18 +56,24 @@ input[type=checkbox], input[type=range] { accent-color: var(--accent); }
 #world-data { margin: 0; padding: 16px; min-height: 220px; white-space: pre-wrap; overflow-wrap: anywhere; }
 .jumble { display: grid; gap: 19px; padding: clamp(14px, 3vw, 28px); }
 .jumble h3 { margin: 0 0 10px; color: var(--muted); font-size: 12px; font-weight: 600; }
+.jumble-progress { display: flex; flex-wrap: wrap; align-items: center; gap: 9px 12px; }
+.jumble-progress h3 { margin: 0; color: inherit; }
+.jumble-progress progress { flex: 1; min-width: 65px; height: 9px; accent-color: var(--accent); }
+.jumble-progress span, .attempt-stage { color: var(--muted); font: 10px var(--mono); }
 .word-list { display: flex; flex-wrap: wrap; gap: 7px; list-style: none; margin: 0; padding: 0; }
 .word-list li { padding: 7px 11px; border: 1px solid #32495e; border-radius: 7px; background: #142334; font: 600 15px var(--mono); }
 .jumble-attempts { display: grid; gap: 7px; max-height: 280px; overflow-y: auto; padding: 3px; margin: -3px; list-style: none; scrollbar-width: thin; }
 .jumble-attempt { display: grid; grid-template-columns: 2ch minmax(0, 1fr); align-items: baseline; gap: 8px; padding: 9px; border: 1px solid var(--line); border-radius: 7px; background: var(--surface); }
 .jumble-attempt[data-correct="true"] { border-color: #397664; }
 .attempt-number, .attempt-feedback { color: var(--muted); font-size: 11px; }
+.attempt-stage { display: block; margin-bottom: 4px; }
 .attempt-answer { overflow-wrap: anywhere; white-space: pre-wrap; font: 13px var(--mono); }
 .attempt-feedback { display: block; margin-top: 5px; }
 .jumble-attempt[data-correct="true"] .attempt-feedback { color: var(--accent); }
 .jumble-solution { border-top: 1px solid var(--line); padding-top: 13px; }
 .jumble-solution p { margin: 0; line-height: 1.5; }
 .jumble-solution strong { color: var(--accent); }
+.jumble-solution .jumble-explanation { color: var(--muted); font-size: 13px; margin-top: 5px; }
 .action-now { min-height: 68px; padding: 8px 12px; border-top: 1px solid var(--line); background: #142131; }
 .action-heading { display: flex; gap: 8px; align-items: center; min-height: 20px; font-size: 13px; }
 .actor { font: 600 10px var(--mono); color: var(--agent); padding: 4px 6px; border: 1px solid color-mix(in srgb, var(--agent) 40%, transparent); border-radius: 5px; white-space: nowrap; }

@@ -15,17 +15,23 @@ from levels.word_jumble import Puzzle, SENTENCES
 
 
 class WordJumbleTests(unittest.TestCase):
-    def test_seeded_words_are_shuffled_without_changing_the_sentence(self):
+    def test_seeded_shuffles_preserve_the_words_of_every_stage(self):
         sentences = set()
         for seed in range(300):
             puzzle = Puzzle(seed, ["1"])
-            ordered = re.findall(r"[a-z]+", puzzle.sentence.lower())
-            words = puzzle.act("1", "read", {})["words"]
-            self.assertEqual(words, Puzzle(seed, ["1"]).act("1", "read", {})["words"])
-            self.assertCountEqual(words, ordered)
-            self.assertNotEqual("".join(word[0] for word in words), puzzle.answer)
-            self.assertEqual("".join(word[0] for word in ordered), puzzle.answer)
-            sentences.add(puzzle.sentence)
+            self.assertEqual(len(puzzle.stages), 10)
+            self.assertEqual(puzzle.stages, Puzzle(seed, ["1"]).stages)
+            for stage in puzzle.stages:
+                ordered = re.findall(r"[a-z]+", stage.clue.lower())
+                self.assertCountEqual(stage.words, ordered)
+                self.assertNotEqual(stage.words, tuple(ordered))
+            opening = puzzle.stages[0]
+            ordered = re.findall(r"[a-z]+", opening.clue.lower())
+            self.assertNotEqual("".join(word[0] for word in opening.words), opening.answer)
+            self.assertEqual("".join(word[0] for word in ordered), opening.answer)
+            self.assertEqual(len({stage.answer for stage in puzzle.stages}), 10)
+            self.assertTrue(all(stage.explanation for stage in puzzle.stages[1:]))
+            sentences.add(opening.clue)
         self.assertEqual(sentences, set(SENTENCES))
 
     def test_requires_one_agent(self):
@@ -41,31 +47,61 @@ class WordJumbleTests(unittest.TestCase):
         self.assertEqual(summary["status"], "solved")
         self.assertEqual(summary["score"], 1)
         self.assertEqual(summary["metrics"]["requests"], 0)
-        self.assertEqual(summary["metrics"]["tool_calls"], 4)
-        self.assertTrue(all(frame["world"]["solution"] is None for frame in records if not frame["won"]))
+        self.assertEqual(summary["metrics"]["tool_calls"], 22)
         attempts = [frame["event"] for frame in records if frame["event"].get("name") == "submit"]
         self.assertEqual([attempt["result"]["feedback"] for attempt in attempts],
-                         ["Too long. Submit a single word.", "Incorrect.", "Correct."])
+                         ["Too long. Submit a single word.", "Incorrect."]
+                         + ["Success. Next puzzle is available."] * 9
+                         + ["Success. All ten puzzles are solved."])
+        solved = [frame for frame in records if frame["event"].get("result", {}).get("correct")]
+        self.assertEqual(len(solved), 10)
+        for number, frame in enumerate(solved, 1):
+            self.assertEqual(frame["score"], number / 10)
+            self.assertEqual(frame["won"], number == 10)
+            self.assertEqual(frame["world"]["completed"], number)
+            self.assertEqual(frame["world"]["stage"], min(number + 1, 10))
+            self.assertEqual(frame["world"]["solution"]["stage"], number)
+            self.assertEqual(frame["world"]["solution"]["answer"], frame["event"]["arguments"]["answer"])
+        self.assertTrue(all(frame["world"]["solution"] is None for frame in records[:solved[0]["index"]]))
         self.assertEqual(records[-1]["world"]["solution"]["answer"], attempts[-1]["arguments"]["answer"])
+
+    def test_future_answers_and_wrong_answers_cannot_advance_current_stage(self):
+        puzzle = Puzzle(42, ["1"])
+        before = puzzle.act("1", "read", {})
+        later = puzzle.stages[1].answer
+        self.assertFalse(puzzle.act("1", "submit", {"answer": later})["correct"])
+        self.assertEqual(puzzle.evaluate(), (False, 0))
+        self.assertEqual(puzzle.act("1", "read", {}), before)
+        self.assertTrue(puzzle.act("1", "submit", {"answer": puzzle.stages[0].answer})["correct"])
+        self.assertEqual(puzzle.evaluate(), (False, 0.1))
+        self.assertEqual(puzzle.act("1", "read", {}), {"words": list(puzzle.stages[1].words)})
 
     def test_model_sees_only_goal_tools_and_requested_words(self):
         with TemporaryDirectory() as directory:
             settings = Settings(level="word_jumble", seed=42, model="example/model")
             backend = Mock()
             run = Run(settings, Path(directory), Event(), backend)
-            turns = iter([("read", {}), ("submit", {"answer": " " + run.puzzle.answer.upper() + " "})])
+            turns = iter((index, name) for index in range(10) for name in ("read", "submit"))
 
             def respond(history, tools):
-                name, arguments = next(turns)
+                index, name = next(turns)
+                stage = run.puzzle.stages[index]
+                self.assertEqual(run.puzzle.completed, index)
                 self.assertEqual([tool["function"]["name"] for tool in tools], ["read", "submit"])
                 self.assertEqual(history[0], {"role": "user", "content": "Submit the correct answer."})
+                arguments = {}
                 if name == "read":
-                    self.assertEqual(len(history), 1)
-                    self.assertNotIn(run.puzzle.answer, json.dumps(tools))
+                    if index == 0:
+                        self.assertEqual(len(history), 1)
+                        self.assertNotIn(stage.answer, json.dumps(tools))
+                    else:
+                        self.assertEqual(json.loads(history[-1]["content"]),
+                                         {"correct": True, "feedback": "Success. Next puzzle is available."})
                 else:
-                    self.assertEqual(json.loads(history[-1]["content"]), {"words": run.puzzle.words})
+                    self.assertEqual(json.loads(history[-1]["content"]), {"words": list(stage.words)})
+                    arguments = {"answer": " " + stage.answer.upper() + " "}
                 return Reply({"tool_calls": [{
-                    "id": "call_" + name,
+                    "id": f"call_{index}_{name}",
                     "type": "function",
                     "function": {"name": name, "arguments": json.dumps(arguments)},
                 }]}, {})
@@ -73,7 +109,7 @@ class WordJumbleTests(unittest.TestCase):
             backend.complete.side_effect = respond
             summary = run.execute()
         self.assertEqual(summary["status"], "solved")
-        self.assertEqual(summary["rounds"], 2)
+        self.assertEqual(summary["rounds"], 20)
 
 
 class LauncherTests(unittest.TestCase):
@@ -106,14 +142,13 @@ class LauncherTests(unittest.TestCase):
     def test_model_launch_uses_configured_model_and_selected_level(self):
         with TemporaryDirectory() as directory, patch("dojo.launcher.OpenRouter") as backend:
             root = Path(directory)
-            settings = Settings(model="example/model", seed=42, rounds=8, agents=4)
+            settings = Settings(model="example/model", seed=42, rounds=12, agents=4)
             launcher = Launcher(settings, root, "test-key")
-            answer = Puzzle(42, ["1"]).answer
-            backend.return_value.complete.return_value = Reply({"tool_calls": [{
-                "id": "call_submit",
+            backend.return_value.complete.side_effect = [Reply({"tool_calls": [{
+                "id": f"call_submit_{index}",
                 "type": "function",
-                "function": {"name": "submit", "arguments": json.dumps({"answer": answer})},
-            }]}, {})
+                "function": {"name": "submit", "arguments": json.dumps({"answer": stage.answer})},
+            }]}, {}) for index, stage in enumerate(Puzzle(42, ["1"]).stages)]
             launcher.launch("word_jumble", "model")
             launcher.wait()
             summary, = summaries(root)
@@ -121,5 +156,5 @@ class LauncherTests(unittest.TestCase):
             self.assertEqual(summary["settings"]["model"], "example/model")
             self.assertEqual(summary["settings"]["level"], "word_jumble")
             self.assertEqual(summary["settings"]["agents"], 1)
-            self.assertEqual(summary["settings"]["rounds"], 8)
+            self.assertEqual(summary["settings"]["rounds"], 12)
             self.assertEqual(summary["status"], "solved")
