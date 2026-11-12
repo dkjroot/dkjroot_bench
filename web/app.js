@@ -4,6 +4,20 @@ const integer = new Intl.NumberFormat();
 const dollars = new Intl.NumberFormat("en-US", {
   style: "currency", currency: "USD", minimumFractionDigits: 2, maximumFractionDigits: 6,
 });
+const dollarsToCents = new Intl.NumberFormat("en-US", {style: "currency", currency: "USD"});
+// https://ai.google.dev/gemini-api/docs/pricing
+// Standard paid USD per million tokens for this benchmark's text and image requests.
+const geminiRates = new Map([
+  ["gemini-3.8-flash", [
+    {since: "2027-01-01", input: 1.50, cached: 0.15, output: 7.50},
+    {since: "", input: 0.75, cached: 0.075, output: 3.75},
+  ]],
+  ["gemini-3.1-flash-lite", [{since: "", input: 0.25, cached: 0.025, output: 1.50}]],
+  ["gemini-3.5-flash-lite", [{since: "", input: 0.30, cached: 0.03, output: 2.50}]],
+  ["gemini-2.5-flash", [{since: "", input: 0.30, cached: 0.03, output: 2.50}]],
+]);
+const estimatedCostNote = "Estimated using Google's published standard paid rates at the start of the run. "
+  + "Cached input is discounted when recorded. Actual billing may differ.";
 const labels = {
   running: "Running", paused: "Paused", solved: "Solved", round_limit: "Round limit",
   agents_stopped: "Agents stopped", interrupted: "Interrupted", error: "Error",
@@ -11,8 +25,8 @@ const labels = {
 let runs = [], selected = "", frames = [], offset = 0, cursor = 0;
 let catalog = {levels: []}, selectedPuzzle = "", requestedRun = null, launching = false, stoppingRun = null;
 let changingPause = false, roundInputRun = null, nextRounds = "";
-let follow = true, streaming = false, replay = false, playbackTimer = null;
-let replayVisible = false;
+let follow = true, streaming = false, replay = false, playbackFrame = null;
+let playback = null, activeBubble = null, bubbleTimer = null;
 let preview = null, managing = false;
 const recordingUpdates = new Set();
 let commentRun = null;
@@ -48,9 +62,18 @@ function chosen() {
   return runs.find(run => run.id === selected);
 }
 
+function localRecording() {
+  const run = chosen();
+  return run?.public_id ? runs.find(local => local.id === run.public_id && local.same_public_replay) : run;
+}
+
 function updateRecordings(preferred, fromStart) {
-  const recordings = runs.filter(run => run.settings.level === selectedPuzzle);
+  const duplicates = new Map(runs.filter(run => run.settings.level === selectedPuzzle
+      && run.same_public_replay && run.id !== catalog.active_run)
+    .map(run => [run.id, "git/" + run.id]));
+  const recordings = runs.filter(run => run.settings.level === selectedPuzzle && !duplicates.has(run.id));
   const next = [preferred, selected]
+    .map(id => duplicates.get(id) ?? id)
     .find(id => recordings.some(run => run.id === id)) ?? "";
   const select = $("runs");
   options(select, [["", recordings.length ? "Choose a recording" : "No recordings"],
@@ -80,7 +103,7 @@ function renderLaunchControls() {
   const exhausted = paused && catalog.paused_round >= catalog.max_rounds;
   const canDemo = catalog.can_demo && level?.demo;
   const canModel = catalog.can_launch && level && catalog.model;
-  const recording = chosen();
+  const recording = localRecording();
   const saved = catalog.can_pause && recording?.resumable && !active
     && recording.harness_version === catalog.harness_version && recording.level_version === level?.version
     && (recording.settings.model !== "demo" || catalog.can_demo) ? recording : null;
@@ -146,7 +169,7 @@ async function launch(mode) {
   if (!input.reportValidity()) return;
   const level = selectedPuzzle;
   const continuing = mode === "continue";
-  const request = continuing ? {id: selected} : {level, mode};
+  const request = continuing ? {id: localRecording().id} : {level, mode};
   if (input.value !== "") request.rounds = input.valueAsNumber;
   launching = true;
   $("launch-status").hidden = true;
@@ -154,9 +177,10 @@ async function launch(mode) {
   try {
     const data = await postRun(continuing ? "continue" : "launch", request, "Could not start the run.");
     if (selectedPuzzle === level) {
-      if (continuing && selected === data.id) {
+      if (continuing && localRecording()?.id === data.id) {
+        if (selected !== data.id) selectRun(data.id);
         stopReplay();
-        replayVisible = follow = true;
+        follow = true;
         streaming = false;
         if (frames.length) stepTo(frames.length - 1);
       } else {
@@ -222,13 +246,12 @@ function selectRun(id, fromStart = false) {
   offset = cursor = 0;
   focus = renderer = null;
   stopReplay();
+  playback = null;
+  clearBubble();
   const run = chosen();
   follow = fromStart || Boolean(run && run.id === catalog.active_run);
-  replayVisible = follow;
   streaming = fromStart || run?.status === "running";
   renderLaunchControls();
-  if (animation !== null) cancelAnimationFrame(animation);
-  animation = null;
   progress = 1;
   render();
   if (!run) {
@@ -317,8 +340,8 @@ async function poll() {
           frames.push(frame);
         }
         if (follow && !streaming) cursor = Math.max(0, frames.length - 1);
-        render();
         schedulePlayback();
+        render();
       }
     }
     $("connection").hidden = true;
@@ -342,8 +365,34 @@ function usage(metrics, field) {
   return metrics?.missing_usage?.[field] ? null : metrics?.[field];
 }
 
+function geminiCost(run, metrics) {
+  const rates = geminiRates.get(run.settings.model)?.find(rate => run.started_at.slice(0, 10) >= rate.since);
+  const input = usage(metrics, "input_tokens");
+  if (!rates || !Number.isSafeInteger(input) || input < 0) return null;
+  let output = usage(metrics, "output_tokens");
+  // Older recordings may omit output counts on empty replies but still include total usage.
+  if (output == null) {
+    const total = usage(metrics, "total_tokens");
+    if (!Number.isSafeInteger(total) || total - input < (metrics.output_tokens ?? 0)) return null;
+    output = total - input;
+  }
+  if (!Number.isSafeInteger(output) || output < 0) return null;
+  const cached = metrics.cached_input_tokens ?? 0;
+  if (!Number.isSafeInteger(cached) || cached < 0 || cached > input) return null;
+  return ((input - cached) * rates.input + cached * rates.cached + output * rates.output) / 1_000_000;
+}
+
+function costText(run, value, markEstimate = true) {
+  const estimated = value != null && run.settings.backend === "gemini";
+  const price = estimated && value >= 1 ? dollarsToCents.format(value) : format("cost_usd", value);
+  return price + (estimated && markEstimate ? " (est.)" : "");
+}
+
 function renderMetrics(run, frame) {
   const metrics = frame.metrics;
+  const demo = run.settings.model === "demo";
+  const estimated = !demo && run.settings.backend === "gemini";
+  const cost = demo ? null : estimated ? geminiCost(run, metrics) : usage(metrics, "cost_usd");
   const ending = frame.event.kind === "finish";
   const status = frame.won ? "solved" : ending ? frame.event.status
     : frame.event.kind === "pause" ? "paused" : "running";
@@ -352,13 +401,13 @@ function renderMetrics(run, frame) {
     ["Score", format("score", frame.score)],
     ["Elapsed", format("elapsed_seconds", frame.elapsed_seconds)],
     ["Round", integer.format(frame.round)],
-    ["Tokens", run.settings.model === "demo" ? "—" : format("total_tokens", usage(metrics, "total_tokens"))],
-    ["API cost", run.settings.model === "demo" ? "—" : format("cost_usd", usage(metrics, "cost_usd"))],
+    ["Tokens", demo ? "—" : format("total_tokens", usage(metrics, "total_tokens"))],
+    [estimated ? "Estimated cost" : "API cost", costText(run, cost, false), estimated ? estimatedCostNote : null],
   ];
-  $("metrics").replaceChildren(...pairs.map(([key, value]) => {
+  $("metrics").replaceChildren(...pairs.map(([key, value, note]) => {
     const item = el("div", "metric");
     const data = el("dd", "", value);
-    data.title = value;
+    data.title = note ?? value;
     data.dataset.success = key === "Status" && frame.won;
     item.append(el("dt", "", key), data);
     return item;
@@ -390,7 +439,7 @@ function renderWorld(frame) {
       focus,
       sight: $("vision").checked,
       actor: frame.event.kind === "tool" ? frame.event.agent : null,
-      bubble: bubbleFor(frame.event),
+      bubble: activeBubble,
       move: renderer.supportsMotion ? motionFor(frame) : null,
       tick: renderer.supportsTickMotion ? tickMotionFor(frame) : null,
     });
@@ -398,6 +447,10 @@ function renderWorld(frame) {
 }
 
 function tickMotionFor(frame) {
+  if (playback?.tick) {
+    const {from, to, elapsed, duration} = playback.tick;
+    return {from, to, progress: (elapsed + playback.elapsed) / duration};
+  }
   const from = frames[cursor - 1]?.world;
   return frame.event.kind === "tick" && from ? {from, progress: ease(progress)} : null;
 }
@@ -413,20 +466,38 @@ function bubbleFor(event) {
   return null;
 }
 
-function motionFor(frame) {
+function clearBubble() {
+  clearTimeout(bubbleTimer);
+  activeBubble = null;
+}
+
+function showBubble(event) {
+  const bubble = bubbleFor(event);
+  if (!bubble) return;
+  clearBubble();
+  activeBubble = bubble;
+  bubbleTimer = setTimeout(() => {
+    activeBubble = null;
+    if (!comparing && !managing && frames[cursor]) renderWorld(frames[cursor]);
+  }, 1400);
+}
+
+function motionFor(frame, index = cursor) {
   const event = frame.event;
   if (event.kind !== "tool" || !["moveX", "moveY"].includes(event.name)) return null;
-  const world = frames[cursor - 1]?.world;
+  const world = frames[index - 1]?.world;
   const from = world?.players?.find(player => player.id === event.agent);
   const to = frame.world.players?.find(player => player.id === event.agent);
   return from && to && (from.x !== to.x || from.y !== to.y) ? {from, world, progress: ease(progress)} : null;
 }
 
-function tweenDuration(frame) {
+function tweenDuration(index, continuousTicks = false) {
   if (reducedMotion.matches) return 0;
-  const move = renderer?.supportsMotion && motionFor(frame);
+  const frame = frames[index];
+  const move = renderer?.supportsMotion && motionFor(frame, index);
   if (move) return 320 + Math.min(200, Math.abs(frame.event.arguments?.steps ?? 1) * 30);
-  return renderer?.supportsTickMotion && tickMotionFor(frame) ? 330 : 0;
+  return !continuousTicks && renderer?.supportsTickMotion && frame.event.kind === "tick" && index > 0
+    ? 330 : 0;
 }
 
 function renderAgentObservation() {
@@ -719,13 +790,11 @@ function render() {
   $("run-caption").textContent = run
     ? (run.settings.model === "demo" ? "Scripted demo" : run.settings.model) + " · Seed " + run.settings.seed
     : setup ? "Round 0 · Preview seed " + setup.seed : "Spectator view";
-  const showing = Boolean(frame && replayVisible);
-  const ready = Boolean(frame && !replayVisible);
+  const showing = Boolean(frame);
   $("empty").hidden = showing || Boolean(setup);
-  $("empty-message").textContent = run ? (ready ? "Recording ready." : "Waiting for the first recorded frame…")
+  $("empty-message").textContent = run ? "Waiting for the first recorded frame…"
     : runs.some(item => item.settings.level === selectedPuzzle) ? "Choose a recording or start a run."
     : "No recordings for this puzzle yet.";
-  $("open-replay").hidden = !ready;
   $("observation").hidden = !showing && !setup;
   if (comparing || managing) return;
   for (const id of ["metrics", "current-action", "round-flow", "replay-controls", "record-details"]) {
@@ -764,18 +833,23 @@ function render() {
 }
 
 function stopReplay() {
-  clearTimeout(playbackTimer);
-  playbackTimer = null;
+  if (playbackFrame !== null) cancelAnimationFrame(playbackFrame);
+  if (animation !== null) cancelAnimationFrame(animation);
+  playbackFrame = null;
+  animation = null;
   replay = false;
 }
 
 function stepTo(index, animate = false) {
   cursor = index;
+  playback = null;
   if (animation !== null) cancelAnimationFrame(animation);
   animation = null;
   progress = 1;
   const frame = frames[cursor];
-  const tween = animate && tweenDuration(frame);
+  showBubble(frame.event);
+  schedulePlayback();
+  const tween = animate && playbackFrame === null && tweenDuration(index);
   if (tween) {
     progress = 0;
     const start = performance.now();
@@ -793,31 +867,63 @@ function stepTo(index, animate = false) {
 function seek(index, animate = false) {
   stopReplay();
   follow = false;
+  clearBubble();
   stepTo(index, animate);
 }
 
-function schedulePlayback() {
-  if (playbackTimer !== null || comparing || managing || !(replay || (follow && streaming))
-      || cursor >= frames.length - 1) return;
-  const event = frames[cursor].event;
-  const linger = ["look", "read", "submit"].includes(event.name) || event.name?.startsWith("message");
+function playbackDelay(index, tween) {
+  const event = frames[index].event;
+  const linger = ["look", "read", "submit"].includes(event.name);
   const delay = renderer?.playbackDelay?.(event) ?? (linger ? 650 : event.kind === "round" ? 140 : 310);
-  const duration = Math.max(delay, tweenDuration(frames[cursor]) + 45, bubbleFor(event) ? 1400 : 0);
-  playbackTimer = setTimeout(() => {
-    playbackTimer = null;
-    if (cursor + 1 === frames.length - 1) replay = false;
-    stepTo(cursor + 1, true);
-    schedulePlayback();
-  }, duration / Number($("speed").value));
+  return Math.max(delay, tween + 45);
 }
 
-function playRecording() {
-  stopReplay();
-  follow = false;
-  replayVisible = true;
-  replay = frames.length !== 1;
-  if (frames.length) stepTo(0);
-  schedulePlayback();
+function tickSpan() {
+  // The event cursor still visits every action between the two physics snapshots.
+  let start = cursor;
+  while (start > 0 && frames[start].event.kind !== "tick") start--;
+  let end = cursor + 1;
+  while (end < frames.length && frames[end].event.kind !== "tick") end++;
+  if (end === frames.length) return null;
+  let elapsed = 0, duration = 0;
+  for (let index = start; index < end; index++) {
+    const delay = playbackDelay(index, tweenDuration(index, true));
+    if (index < cursor) elapsed += delay;
+    duration += delay;
+  }
+  return {from: frames[start].world, to: frames[end].world, elapsed, duration};
+}
+
+function schedulePlayback() {
+  if (playbackFrame !== null || comparing || managing || !(replay || (follow && streaming))
+      || cursor >= frames.length - 1) return;
+  if (!playback) {
+    const continuousTicks = replay && renderer?.supportsTickMotion && !reducedMotion.matches;
+    const tween = tweenDuration(cursor, continuousTicks);
+    const elapsed = animation === null ? 0 : progress * tween;
+    playback = {elapsed, tween, duration: playbackDelay(cursor, tween), tick: continuousTicks ? tickSpan() : null};
+  }
+  if (animation !== null) cancelAnimationFrame(animation);
+  animation = null;
+  progress = playback.tween ? Math.min(1, playback.elapsed / playback.tween) : 1;
+  let previousTime = performance.now();
+  const advance = time => {
+    playback.elapsed += Math.max(0, time - previousTime) * Number($("speed").value);
+    previousTime = time;
+    if (playback.elapsed >= playback.duration) {
+      playbackFrame = null;
+      const next = cursor + 1;
+      const live = !replay;
+      if (next === frames.length - 1) replay = false;
+      stepTo(next, live);
+      return;
+    }
+    const moving = progress < 1;
+    progress = playback.tween ? Math.min(1, playback.elapsed / playback.tween) : 1;
+    if (moving || playback.tick) renderWorld(frames[cursor]);
+    playbackFrame = requestAnimationFrame(advance);
+  };
+  playbackFrame = requestAnimationFrame(advance);
 }
 
 $("puzzle").addEventListener("change", event => {
@@ -826,7 +932,6 @@ $("puzzle").addEventListener("change", event => {
   selectPuzzle(event.target.value);
 });
 $("runs").addEventListener("change", event => selectRun(event.target.value));
-$("open-replay").addEventListener("click", playRecording);
 $("run-demo").addEventListener("click", () => launch("demo"));
 $("run-model").addEventListener("click", () => launch("model"));
 $("continue-run").addEventListener("click", () => launch("continue"));
@@ -836,24 +941,27 @@ $("vision").addEventListener("change", render);
 $("timeline").addEventListener("input", event => seek(Number(event.target.value)));
 $("previous").addEventListener("click", () => seek(cursor - 1));
 $("next").addEventListener("click", () => seek(cursor + 1, true));
-$("speed").addEventListener("change", () => {
-  clearTimeout(playbackTimer);
-  playbackTimer = null;
-  schedulePlayback();
-});
 $("latest").addEventListener("click", () => {
   stopReplay();
+  clearBubble();
   follow = true;
   stepTo(frames.length - 1);
 });
 $("play").addEventListener("click", () => {
   if (isPlaying()) {
-    seek(cursor);
+    stopReplay();
+    follow = false;
+    render();
   } else {
     follow = false;
     replay = true;
-    stepTo(cursor === frames.length - 1 ? 0 : cursor);
-    schedulePlayback();
+    if (cursor === frames.length - 1) {
+      clearBubble();
+      stepTo(0);
+    } else {
+      schedulePlayback();
+      render();
+    }
   }
 });
 
@@ -877,8 +985,8 @@ function showPage(page) {
 
 function watchRun(run) {
   selectPuzzle(run.settings.level, run.id);
+  if (frames.length && selected !== catalog.active_run) seek(0);
   showPage("spectate");
-  playRecording();
 }
 
 function openComment(run) {
@@ -1037,6 +1145,7 @@ const recordedRuns = () => {
 };
 
 function runMetric(run, field) {
+  if (field === "cost_usd" && run.settings.backend === "gemini") return geminiCost(run, run.metrics);
   return run[field] ?? usage(run.metrics, field);
 }
 
@@ -1066,6 +1175,7 @@ function renderComparison() {
   $("chart-note").textContent = !data.length
     ? "No published runs match these filters."
     : !samples.length ? "No results are available for this metric."
+    : metric === "cost_usd" && samples.some(([run]) => run.settings.backend === "gemini") ? estimatedCostNote
     : "Each bar is one run. The table includes the seed, outcome and run settings.";
   const max = metric === "score" ? 1 : Math.max(0, ...samples.map(([, value]) => value));
   const models = [...new Set(samples.map(([run]) => run.settings.model))];
@@ -1079,14 +1189,13 @@ function renderComparison() {
     row.title = [runLabel(run), run.comment].filter(Boolean).join("\n");
     const label = el("span", "", run.settings.model + " · " + run.settings.seed);
     if (run.comment) label.append(el("small", "graph-comment", run.comment));
-    row.append(label, track,
-      el("span", "bar-value", format(metric, value)));
+    row.append(label, track, el("span", "bar-value", metric === "cost_usd" ? costText(run, value) : format(metric, value)));
     return row;
   }));
 
   const table = el("table");
   const head = table.createTHead().insertRow();
-  ["Run", "Model", "Provider", "Seed", "Result", "Score", "Halts", "Elapsed", "Tokens", "API cost", "Setup", "Comment"]
+  ["Run", "Model", "Provider", "Seed", "Result", "Score", "Halts", "Elapsed", "Tokens", "Cost (USD)", "Setup", "Comment"]
     .forEach(value => head.append(el("th", "", value)));
   const body = table.createTBody();
   for (const run of data) {
@@ -1107,7 +1216,7 @@ function renderComparison() {
       format("halts", runMetric(run, "halts")),
       format("elapsed_seconds", run.elapsed_seconds),
       format("total_tokens", runMetric(run, "total_tokens")),
-      format("cost_usd", runMetric(run, "cost_usd")),
+      costText(run, runMetric(run, "cost_usd")),
       settings.agents + (settings.agents === 1 ? " agent" : " agents") + " · " + settings.rounds + " rounds"
         + " · " + settings.max_completion_tokens + " max reply tokens · "
         + (settings.reasoning_effort ?? "default reasoning"),

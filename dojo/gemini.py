@@ -23,6 +23,10 @@ def usage_counts(response):
         values = (usage.get(primary, 0), usage.get(extra, 0))
         if (primary in usage or extra in usage) and all(type(value) is int and value >= 0 for value in values):
             counts[metric] = sum(values)
+    cached = usage.get("cachedContentTokenCount")
+    prompt = usage.get("promptTokenCount")
+    if type(cached) is int and type(prompt) is int and 0 <= cached <= prompt:
+        counts["cached_prompt_tokens"] = cached
     return counts
 
 

@@ -124,6 +124,7 @@ class GeminiTests(unittest.TestCase):
                                         "finishReason": "STOP"}],
                         "modelVersion": model, "responseId": "generation",
                         "usageMetadata": {"promptTokenCount": 12, "toolUsePromptTokenCount": 2,
+                                          "cachedContentTokenCount": 4,
                                           "candidatesTokenCount": 3, "thoughtsTokenCount": 5,
                                           "totalTokenCount": 22},
                     }).encode())
@@ -138,11 +139,14 @@ class GeminiTests(unittest.TestCase):
                 self.assertEqual(summary["settings"]["backend"], "gemini")
                 self.assertEqual(summary["providers"], ["Google Gemini"])
                 self.assertEqual(summary["metrics"]["input_tokens"], 12 * 14)
+                self.assertEqual(summary["metrics"]["cached_input_tokens"], 12 * 4)
                 self.assertEqual(summary["metrics"]["output_tokens"], 12 * 8)
                 self.assertEqual(summary["metrics"]["total_tokens"], 12 * 22)
                 self.assertEqual(summary["metrics"]["halts"], 8)
                 self.assertEqual(summary["metrics"]["missing_usage"]["cost_usd"], 12)
                 saved, _ = frames(root / run_id, 0)
+                requests = [frame["event"] for frame in saved if frame["event"]["kind"] == "request"]
+                self.assertEqual([event["usage"]["cached_prompt_tokens"] for event in requests], [4] * 12)
                 recorded = {event["agent"]: event["image"] for frame in saved
                             if "image" in (event := frame["event"])}
                 self.assertEqual(set(recorded), {"1", "2"})

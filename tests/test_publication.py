@@ -65,10 +65,19 @@ class PublicationTests(unittest.TestCase):
             lists = recording_lists(local, public)
             self.assertFalse(lists["local"][0]["published_locally"])
             self.assertTrue(lists["local"][0]["published_to_git"])
+            self.assertTrue(lists["local"][0]["same_public_replay"])
             self.assertEqual(lists["public"][0]["id"], run_id)
             with self.assertRaisesRegex(ValueError, "Git-published"):
                 delete_recording(local, public, run_id)
             self.assertTrue(run.record.directory.exists())
+            local_replay = run.record.directory / "frames.jsonl"
+            original = local_replay.read_bytes()
+            updated = original.replace(b'"kind":"start"', b'"kind":"other"', 1)
+            self.assertNotEqual(updated, original)
+            local_replay.write_bytes(updated)
+            local_recording = recording_lists(local, public)["local"][0]
+            self.assertTrue(local_recording["published_to_git"])
+            self.assertFalse(local_recording["same_public_replay"])
 
     def test_delete_removes_a_finished_local_recording_and_its_publication_marker(self):
         with TemporaryDirectory() as directory:

@@ -1,3 +1,4 @@
+import filecmp
 import json
 import shutil
 from pathlib import Path
@@ -25,11 +26,26 @@ def recording_lists(root, public_root):
     published = {run["id"]: run for run in public}
     local = summaries(root)
     for run in local:
-        run["published_locally"] = (root / run["id"] / ".published-locally").is_file()
-        run["published_to_git"] = run["id"] in published
-        run["comment"] = (published[run["id"]]["comment"] if run["published_to_git"]
-                          else read_comment(root / run["id"]))
+        run_id = run["id"]
+        directory = root / run_id
+        run["published_locally"] = (directory / ".published-locally").is_file()
+        run["published_to_git"] = run_id in published
+        run["same_public_replay"] = (run["published_to_git"]
+                                     and same_replay(directory, public_root / run_id))
+        run["comment"] = published[run_id]["comment"] if run["published_to_git"] else read_comment(directory)
     return {"local": local, "public": public}
+
+
+def same_replay(local, public):
+    left, right = local / "frames.jsonl", public / "frames.jsonl"
+    if left.is_symlink() or right.is_symlink():
+        return False
+    try:
+        # A resumed local run can share the ID of an older public snapshot.
+        # filecmp caches comparisons while the files' stat signatures match.
+        return filecmp.cmp(left, right, shallow=False)
+    except OSError:
+        return False
 
 
 def read_comment(directory):

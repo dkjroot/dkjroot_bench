@@ -255,7 +255,7 @@ export function drawWorld(canvas, world, options) {
   const ctx = canvas.getContext("2d");
   const layout = world.mechanism_layout;
   const {source, plank, rail, goal, floor} = layout;
-  const {from, progress} = options.tick ?? {from: world, progress: 1};
+  const {from, to = world, progress} = options.tick ?? {from: world, progress: 1};
   const controls = {...world.applied, ...world.pending};
   const neutral = world.version >= 2;
   const background = ctx.createLinearGradient(0, 170, 0, floor);
@@ -276,11 +276,11 @@ export function drawWorld(canvas, world, options) {
   drawCorridor(ctx, world, controls, neutral);
   const speaker = drawPlayers(ctx, world, options);
   drawBucket(ctx, source, 0, {supply: true, neutral});
-  drawPlank(ctx, plank, mix(from.plank_slope, world.plank_slope, progress), neutral);
+  drawPlank(ctx, plank, mix(from.plank_slope, to.plank_slope, progress), neutral);
   drawBucket(ctx, goal, world.goals, {neutral});
 
   const open = world.lid.open;
-  drawGoalLid(ctx, goal, mix(Number(from.lid.open), Number(open), progress), open, neutral);
+  drawGoalLid(ctx, goal, mix(Number(from.lid.open), Number(to.lid.open), progress), open, neutral);
   if (!neutral) {
     label(ctx, "BALL SUPPLY", source.x, 451, {color: "#e2bd9d", size: 13});
     label(ctx, "GRIPPER", 45, 208, {color: muted, align: "left", size: 12});
@@ -294,12 +294,13 @@ export function drawWorld(canvas, world, options) {
 
   const gripper = {};
   for (const field of ["x", "y", "jaws"]) {
-    gripper[field] = mix(from.gripper[field], world.gripper[field], progress);
+    gripper[field] = mix(from.gripper[field], to.gripper[field], progress);
   }
   drawGripper(ctx, rail, gripper);
-  for (const current of world.balls) {
-    const previous = from.balls.find(ball => ball.id === current.id) ?? current;
-    ball(ctx, mix(previous.x, current.x, progress), mix(previous.y, current.y, progress), 10, neutral);
+  for (const ballAtFrame of world.balls) {
+    const previous = from.balls.find(ball => ball.id === ballAtFrame.id) ?? ballAtFrame;
+    const next = to.balls.find(ball => ball.id === ballAtFrame.id) ?? ballAtFrame;
+    ball(ctx, mix(previous.x, next.x, progress), mix(previous.y, next.y, progress), 10, neutral);
   }
   if (speaker) drawBubble(ctx, ...speaker, options.bubble, options.color(options.bubble.agent));
 }

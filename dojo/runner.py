@@ -258,6 +258,10 @@ class Run:
             self.providers.add(reply.provider)
         recorded_usage = {key: usage[key] for key in USAGE_FIELDS.values()
                           if type(usage.get(key)) in (int, float)}
+        cached = usage.get("cached_prompt_tokens")
+        if self.settings.backend == "gemini" and type(cached) is int and cached >= 0:
+            self.metrics["cached_input_tokens"] = self.metrics.get("cached_input_tokens", 0) + cached
+            recorded_usage["cached_prompt_tokens"] = cached
         self.frame("request", agent=agent.id, model=reply.model, provider=reply.provider,
                    generation_id=reply.generation_id, seconds=reply.seconds,
                    finish_reason=reply.finish_reason, usage=recorded_usage, error=reply.error,

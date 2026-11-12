@@ -136,10 +136,10 @@ python3 bench.py --serve
 
 I open [the local viewer](http://127.0.0.1:8765), pick a puzzle, and set
 **Max rounds** if I want a different limit. Then I click **Run**. I can also pick a
-saved recording and click **Play replay**. When I want to try a different
-model, I stop the viewer with Ctrl+C, run `./configure` again, and restart
-it. Each configure command replaces `bench.json`. The runs and replays are
-saved separately under `runs/`.
+saved recording, which opens at the start, and click **Play**. When I want to
+try a different model, I stop the viewer with Ctrl+C, run `./configure` again,
+and restart it. Each configure command replaces `bench.json`. The runs and
+replays are saved separately under `runs/`.
 
 When I open the viewer in serve mode, I get a round-zero preview of the
 selected puzzle. If I leave the seed unset, the preview uses a sample seed
@@ -200,14 +200,18 @@ configured round limit. Press Ctrl+C to stop the viewer.
 ## Look back through the runs
 
 Each run gets a `summary.json` and a `frames.jsonl` replay in its own folder
-under `runs/`. Start `python3 bench.py --serve`, choose a recording and click
-**Play replay** to watch it from the beginning. Keep a copy of `runs/` if you
-want to move the recordings to another machine. The summary records the seed, backend, model,
+under `runs/`. Start `python3 bench.py --serve` and choose a recording to see
+how the game started. Click **Play** to watch it unfold. Keep a copy of `runs/`
+if you want to move the recordings to another machine. The summary records the seed, backend, model,
 provider, elapsed time, time to solve and reported token counts. OpenRouter
-also reports the cost in USD. The viewer leaves the cost blank for direct
-Gemini runs and leaves any other usage total blank if a request came back
-without that metric. Requests already sent during the winning round count
-towards the totals.
+reports the cost in USD. For supported direct Gemini models, the viewer
+estimates the cost in USD using the standard paid rates at the start of the
+run. This includes thinking tokens and discounts cached input when the
+recording has cache counts. Older recordings use the uncached rate for input
+with no cache counts. The estimate can differ from what you pay, for example
+if you use the free tier. Costs and usage totals are blank when there isn't
+enough information to work them out. Requests already sent during the
+winning round count towards the totals. [Google's Gemini API pricing](https://ai.google.dev/gemini-api/docs/pricing)
 
 Glass Tic-Tac-Toe scores from 0 to 1. Each wrong or missing square relative to
 the closest legal X win costs 0.2, down to zero. A square holding more than
