@@ -5,18 +5,26 @@ const dollars = new Intl.NumberFormat("en-US", {
   style: "currency", currency: "USD", minimumFractionDigits: 2, maximumFractionDigits: 6,
 });
 const labels = {
-  running: "Running", solved: "Solved", round_limit: "Round limit",
+  running: "Running", paused: "Paused", solved: "Solved", round_limit: "Round limit",
   agents_stopped: "Agents stopped", interrupted: "Interrupted", error: "Error",
 };
 let runs = [], selected = "", frames = [], offset = 0, cursor = 0;
-let catalog = {levels: []}, selectedPuzzle = "", requestedRun = null, launching = false;
+let catalog = {levels: []}, selectedPuzzle = "", requestedRun = null, launching = false, stoppingRun = null;
+let changingPause = false, roundInputRun = null, nextRounds = "";
 let follow = true, streaming = false, replay = false, playbackTimer = null;
+let replayVisible = false;
+let preview = null, managing = false;
+const recordingUpdates = new Set();
+let commentRun = null;
 let renderer = null, focus = null, comparing = false;
 let animation = null, progress = 1;
 let selection = 0;
 let listing = "";
+let messageCursor = -1;
 const cards = new Map();
+const messageRows = new Map();
 const roundActions = new Map();
+const lastImageFrame = [];
 const reducedMotion = matchMedia("(prefers-reduced-motion: reduce)");
 
 function el(tag, className, text) {
@@ -42,52 +50,159 @@ function chosen() {
 
 function updateRecordings(preferred, fromStart) {
   const recordings = runs.filter(run => run.settings.level === selectedPuzzle);
-  const next = [preferred, selected, recordings[0]?.id]
+  const next = [preferred, selected]
     .find(id => recordings.some(run => run.id === id)) ?? "";
   const select = $("runs");
-  options(select, recordings.length ? recordings.map(run => [run.id, runLabel(run)]) : [["", "No recordings"]]);
+  options(select, [["", recordings.length ? "Choose a recording" : "No recordings"],
+    ...recordings.map(run => [run.id, runLabel(run)])]);
   select.value = next;
   select.disabled = !recordings.length;
   if (next !== selected) selectRun(next, fromStart);
 }
 
 function selectPuzzle(id, preferred, fromStart = false) {
+  const changed = selectedPuzzle !== id;
+  const previous = selected;
   selectedPuzzle = id;
   $("puzzle").value = id;
   updateRecordings(preferred, fromStart);
+  if (changed && !selected && !previous) loadPreview(id);
   renderLaunchControls();
   render();
 }
 
 function renderLaunchControls() {
   const level = catalog.levels.find(level => level.id === selectedPuzzle);
-  const busy = launching || Boolean(requestedRun) || Boolean(catalog.active_run);
-  $("run-demo").hidden = !catalog.can_launch || !level?.demo;
+  const active = catalog.active_run ?? null;
+  const busy = launching || Boolean(requestedRun || active);
+  const stopping = Boolean(active && (catalog.stopping || stoppingRun === active));
+  const paused = Boolean(active && catalog.pause_reason && !stopping);
+  const exhausted = paused && catalog.paused_round >= catalog.max_rounds;
+  const canDemo = catalog.can_demo && level?.demo;
+  const canModel = catalog.can_launch && level && catalog.model;
+  const recording = chosen();
+  const saved = catalog.can_pause && recording?.resumable && !active
+    && recording.harness_version === catalog.harness_version && recording.level_version === level?.version
+    && (recording.settings.model !== "demo" || catalog.can_demo) ? recording : null;
+  const defaults = catalog.round_defaults;
+  const input = $("round-limit");
+  if (roundInputRun !== active) {
+    if (!roundInputRun) nextRounds = input.value;
+    roundInputRun = active;
+    input.value = active ? (catalog.round_limit ?? "") : nextRounds;
+  }
+  if (active && !paused) input.value = catalog.round_limit ?? "";
+  $("round-limit-control").hidden = !(active || canDemo || canModel || saved);
+  input.disabled = active ? !paused || changingPause || exhausted : busy || !(canDemo || canModel || saved);
+  input.min = paused ? catalog.paused_round + 1 : 1;
+  input.max = catalog.max_rounds ?? 1000;
+  input.placeholder = (active ? catalog.round_limit : saved?.settings.rounds ?? defaults?.[canModel ? "model" : "demo"]) ?? "Default";
+  input.title = paused ? "Set the total round limit for this run." : "Leave blank for the default for each run.";
+  $("run-demo").hidden = !canDemo;
   $("run-demo").disabled = busy;
-  $("run-model").hidden = !catalog.can_launch || !level || !catalog.model;
+  $("run-demo").title = defaults ? "Default demo limit: " + defaults.demo + " rounds" : "";
+  $("run-model").hidden = !canModel;
   $("run-model").disabled = busy;
+  $("run-model").title = canModel && defaults ? "Default model limit: " + defaults.model + " rounds" : "";
   $("run-model").textContent = catalog.model ? "Run " + catalog.model : "";
+  $("continue-run").hidden = !saved;
+  $("continue-run").disabled = busy;
+  $("pause-run").hidden = !active || !catalog.can_pause;
+  $("pause-run").disabled = stopping || Boolean(catalog.pausing) || changingPause || exhausted;
+  $("pause-run").textContent = paused ? "Resume run" : catalog.pausing ? "Pausing run…" : "Pause run";
+  $("stop-run").hidden = !active;
+  $("stop-run").disabled = stopping;
+  $("stop-run").textContent = stopping ? "Stopping run…" : "Stop run";
+  const notice = $("run-pause-status");
+  notice.hidden = !paused || !["error", "round_limit"].includes(catalog.pause_reason);
+  if (!notice.hidden) {
+    notice.textContent = catalog.pause_reason === "error" ? "Paused on a model error in round " + (catalog.paused_round + 1) + ". Resume to retry the failed calls."
+      : exhausted ? "Reached the maximum of " + catalog.max_rounds + " rounds. Stop the run to save the replay."
+      : "Paused at round " + catalog.paused_round + ". Increase Max rounds to resume.";
+  }
+}
+
+async function postRun(path, body, failure) {
+  const response = await fetch("/api/" + path, {
+    method: "POST",
+    headers: {"Content-Type": "application/json"},
+    body: JSON.stringify(body),
+  });
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok) throw new Error(data.error ?? failure);
+  if (body.id === catalog.active_run && data.run_state?.active_run === body.id) {
+    Object.assign(catalog, data.run_state);
+  }
+  return data;
+}
+
+function showRunError(error) {
+  $("launch-status").textContent = error.message;
+  $("launch-status").hidden = false;
 }
 
 async function launch(mode) {
+  const input = $("round-limit");
+  if (!input.reportValidity()) return;
+  const level = selectedPuzzle;
+  const continuing = mode === "continue";
+  const request = continuing ? {id: selected} : {level, mode};
+  if (input.value !== "") request.rounds = input.valueAsNumber;
   launching = true;
   $("launch-status").hidden = true;
   renderLaunchControls();
-  const level = selectedPuzzle;
   try {
-    const response = await fetch("/api/launch", {
-      method: "POST",
-      headers: {"Content-Type": "application/json"},
-      body: JSON.stringify({level, mode}),
-    });
-    const data = await response.json().catch(() => ({}));
-    if (!response.ok) throw new Error(data.error ?? "Could not start the run.");
-    if (selectedPuzzle === level) requestedRun = data.id;
+    const data = await postRun(continuing ? "continue" : "launch", request, "Could not start the run.");
+    if (selectedPuzzle === level) {
+      if (continuing && selected === data.id) {
+        stopReplay();
+        replayVisible = follow = true;
+        streaming = false;
+        if (frames.length) stepTo(frames.length - 1);
+      } else {
+        requestedRun = data.id;
+      }
+    }
   } catch (error) {
-    $("launch-status").textContent = error.message;
-    $("launch-status").hidden = false;
+    showRunError(error);
   } finally {
     launching = false;
+    renderLaunchControls();
+  }
+}
+
+async function toggleRunPause() {
+  const id = catalog.active_run;
+  const resuming = Boolean(catalog.pause_reason);
+  const input = $("round-limit");
+  if (resuming && !input.reportValidity()) return;
+  const body = {id};
+  if (resuming && input.value !== "") body.rounds = input.valueAsNumber;
+  changingPause = true;
+  $("launch-status").hidden = true;
+  renderLaunchControls();
+  try {
+    const action = resuming ? "resume" : "pause";
+    await postRun(action, body, "Could not " + action + " the run.");
+  } catch (error) {
+    showRunError(error);
+  } finally {
+    changingPause = false;
+    renderLaunchControls();
+  }
+}
+
+async function stopRun() {
+  const id = catalog.active_run;
+  if (!id || catalog.stopping || stoppingRun === id) return;
+  stoppingRun = id;
+  $("launch-status").hidden = true;
+  renderLaunchControls();
+  try {
+    await postRun("stop", {id}, "Could not stop the run.");
+  } catch (error) {
+    if (stoppingRun === id) stoppingRun = null;
+    showRunError(error);
     renderLaunchControls();
   }
 }
@@ -98,18 +213,28 @@ function selectRun(id, fromStart = false) {
   $("runs").value = id;
   frames = [];
   $("world-content").replaceChildren();
+  messageCursor = -1;
+  messageRows.clear();
+  $("communications-list").replaceChildren();
   roundActions.clear();
+  lastImageFrame.length = 0;
+  $("agent-observation").hidden = true;
   offset = cursor = 0;
-  follow = true;
   focus = renderer = null;
   stopReplay();
   const run = chosen();
+  follow = fromStart || Boolean(run && run.id === catalog.active_run);
+  replayVisible = follow;
   streaming = fromStart || run?.status === "running";
+  renderLaunchControls();
   if (animation !== null) cancelAnimationFrame(animation);
   animation = null;
   progress = 1;
   render();
-  if (!run) return;
+  if (!run) {
+    loadPreview(selectedPuzzle);
+    return;
+  }
   import("/levels/" + encodeURIComponent(run.settings.level) + "/viewer.js")
     .then(module => {
       if (selection !== revision) return;
@@ -118,10 +243,25 @@ function selectRun(id, fromStart = false) {
     }).catch(() => {});
 }
 
+function loadPreview(level) {
+  preview = renderer = null;
+  const revision = ++selection;
+  if (!catalog.levels.some(item => item.id === level)) return;
+  $("world-content").replaceChildren();
+  Promise.all([get("/api/preview?level=" + encodeURIComponent(level)),
+    import("/levels/" + encodeURIComponent(level) + "/viewer.js")])
+    .then(([frame, module]) => {
+      if (selection !== revision || selected) return;
+      preview = frame;
+      renderer = module;
+      render();
+    }).catch(() => {});
+}
+
 function runLabel(run) {
   const model = run.settings.model === "demo" ? "Scripted demo" : run.settings.model;
   const stamp = new Date(run.started_at).toLocaleString([], {dateStyle: "short", timeStyle: "short"});
-  return model + " · " + stamp + " · " + run.settings.seed;
+  return model + " · " + stamp + " · " + run.settings.seed + (run.public_id ? " · Public" : "");
 }
 
 async function get(url) {
@@ -132,27 +272,35 @@ async function get(url) {
 
 async function poll() {
   try {
-    const [nextRuns, nextCatalog] = await Promise.all([get("/api/runs"), get("/api/levels")]);
+    const [recordings, nextCatalog] = await Promise.all([get("/api/recordings"), get("/api/levels")]);
+    const nextRuns = [...recordings.local, ...recordings.public.map(run => ({...run,
+      id: "git/" + run.id, public_id: run.id, resumable: false}))];
     const signature = JSON.stringify([nextRuns, nextCatalog]);
     const requested = nextRuns.find(run => run.id === requestedRun);
     if (signature !== listing || requested) {
       listing = signature;
       runs = nextRuns;
       catalog = nextCatalog;
+      if (stoppingRun !== catalog.active_run) stoppingRun = null;
       const puzzles = new Map(catalog.levels.map(level => [level.id, level.title]));
       for (const run of runs) if (!puzzles.has(run.settings.level)) puzzles.set(run.settings.level, run.level_title);
-      const newest = runs.find(run => run.id === catalog.active_run) ?? runs[0];
-      const initialPuzzle = selectedPuzzle || newest?.settings.level || catalog.levels[0]?.id || "";
+      const live = runs.find(run => run.id === catalog.active_run);
+      const initial = live ?? (catalog.autoplay_latest ? recordings.local[0] : null);
+      const initialPuzzle = selectedPuzzle || initial?.settings.level || catalog.default_level || catalog.levels[0]?.id || "";
       options($("puzzle"), [...puzzles], initialPuzzle);
       $("puzzle").disabled = !puzzles.size;
       if (requested) requestedRun = null;
-      selectPuzzle(initialPuzzle, requested?.id ?? (!selectedPuzzle ? newest?.id : undefined), Boolean(requested));
+      const opening = requested ?? (!selectedPuzzle ? initial : null);
+      selectPuzzle(initialPuzzle, opening?.id, Boolean(requested || (opening && opening !== live)));
       if (comparing) refreshFilters();
+      if (managing) renderRecordings();
     }
     if (selected) {
       const id = selected;
       const revision = selection;
-      const result = await get("/api/runs/" + id + "/frames?after=" + offset);
+      const run = chosen();
+      const path = run?.public_id ? "/api/public/" + run.public_id : "/api/runs/" + id;
+      const result = await get(path + "/frames?after=" + offset);
       if (selection === revision && result.frames.length) {
         offset = result.next_offset;
         for (const frame of result.frames) {
@@ -162,6 +310,10 @@ async function poll() {
             if (!roundActions.has(frame.round)) roundActions.set(frame.round, []);
             roundActions.get(frame.round).push(frames.length);
           }
+          const image = frame.event.image;
+          const hasImage = frame.event.kind === "tool" && typeof image === "string"
+            && image.startsWith("data:image/png;base64,");
+          lastImageFrame.push(hasImage ? frames.length : lastImageFrame.at(-1));
           frames.push(frame);
         }
         if (follow && !streaming) cursor = Math.max(0, frames.length - 1);
@@ -193,7 +345,8 @@ function usage(metrics, field) {
 function renderMetrics(run, frame) {
   const metrics = frame.metrics;
   const ending = frame.event.kind === "finish";
-  const status = frame.won ? "solved" : ending ? frame.event.status : "running";
+  const status = frame.won ? "solved" : ending ? frame.event.status
+    : frame.event.kind === "pause" ? "paused" : "running";
   const pairs = [
     ["Status", labels[status] ?? status],
     ["Score", format("score", frame.score)],
@@ -205,6 +358,7 @@ function renderMetrics(run, frame) {
   $("metrics").replaceChildren(...pairs.map(([key, value]) => {
     const item = el("div", "metric");
     const data = el("dd", "", value);
+    data.title = value;
     data.dataset.success = key === "Status" && frame.won;
     item.append(el("dt", "", key), data);
     return item;
@@ -224,33 +378,151 @@ function renderWorld(frame) {
   } else if (canvas.hidden) {
     $("world-data").textContent = JSON.stringify(frame.world, null, 2);
   } else {
+    const [width, height] = renderer.canvasSize ?? [800, 800];
+    if (canvas.width !== width || canvas.height !== height) {
+      canvas.width = width;
+      canvas.height = height;
+      canvas.dataset.landscape = width > height;
+    }
+    canvas.setAttribute("aria-label", renderer.describeWorld?.(frame.world) ?? "Overhead view of the puzzle");
     renderer.drawWorld(canvas, frame.world, {
       color: id => colors[frame.agents.findIndex(agent => agent.id === id) % colors.length],
       focus,
       sight: $("vision").checked,
       actor: frame.event.kind === "tool" ? frame.event.agent : null,
+      bubble: bubbleFor(frame.event),
       move: renderer.supportsMotion ? motionFor(frame) : null,
+      tick: renderer.supportsTickMotion ? tickMotionFor(frame) : null,
     });
   }
 }
 
-function motionFor(frame) {
-  const event = frame.event;
-  if (event.kind !== "tool" || !["moveX", "moveY"].includes(event.name) || !event.result?.moved) return null;
-  const from = frames[cursor - 1]?.world.players?.find(player => player.id === event.agent);
-  return from ? {from, progress} : null;
+function tickMotionFor(frame) {
+  const from = frames[cursor - 1]?.world;
+  return frame.event.kind === "tick" && from ? {from, progress: ease(progress)} : null;
 }
 
-function messages(list, sent) {
-  if (!list.length) return [el("p", "quiet", "None yet")];
-  return [...list].reverse().map(message => {
-    const node = el("div", "message");
-    const route = sent
-      ? "To " + (message.to.length ? message.to.join(", ") : "no other agents")
-      : "From " + message.from;
-    node.append(el("b", "", route), document.createTextNode(message.text));
-    return node;
-  });
+const ease = value => value * value * (3 - 2 * value);
+
+function bubbleFor(event) {
+  if (event.kind === "thinking") return {agent: event.agent, text: event.text, thinking: true};
+  if (event.kind === "tool" && ["messageOtherAgent", "messageAllOtherAgents"].includes(event.name)
+      && event.result?.delivered_to?.length) {
+    return {agent: event.agent, text: event.arguments?.message};
+  }
+  return null;
+}
+
+function motionFor(frame) {
+  const event = frame.event;
+  if (event.kind !== "tool" || !["moveX", "moveY"].includes(event.name)) return null;
+  const world = frames[cursor - 1]?.world;
+  const from = world?.players?.find(player => player.id === event.agent);
+  const to = frame.world.players?.find(player => player.id === event.agent);
+  return from && to && (from.x !== to.x || from.y !== to.y) ? {from, world, progress: ease(progress)} : null;
+}
+
+function tweenDuration(frame) {
+  if (reducedMotion.matches) return 0;
+  const move = renderer?.supportsMotion && motionFor(frame);
+  if (move) return 320 + Math.min(200, Math.abs(frame.event.arguments?.steps ?? 1) * 30);
+  return renderer?.supportsTickMotion && tickMotionFor(frame) ? 330 : 0;
+}
+
+function renderAgentObservation() {
+  const frame = frames[lastImageFrame[cursor]];
+  $("agent-observation").hidden = !frame;
+  if (!frame) return;
+  const {agent, image} = frame.event;
+  const preview = $("agent-observation-image");
+  if (preview.getAttribute("src") !== image) preview.src = image;
+  preview.alt = "Field as seen by Agent " + agent;
+  $("agent-observation-caption").textContent = "Agent " + agent + " · Round " + frame.round;
+}
+
+function markRead(receipt, agent, read, delivery = false) {
+  const label = "Agent " + agent + (delivery ? (read ? " · Delivered" : " · Pending delivery")
+    : (read ? " · Read" : " · Unread"));
+  receipt.dataset.read = read;
+  receipt.title = label;
+  receipt.setAttribute("aria-label", label);
+}
+
+function messageRow(id, sender, recipients, text, autoMail) {
+  const row = el("li", "message");
+  row.dataset.messageId = id;
+  row.style.setProperty("--sender", colors[Number(sender) - 1]);
+  const to = recipients.length > 1 ? "Agents " + recipients.join(", ")
+    : recipients.length === 1 ? "Agent " + recipients[0] : "no other agents";
+  const content = el("p", "message-content");
+  content.append(el("strong", "message-route", "Agent " + sender + " to " + to + ": "),
+    document.createTextNode(text));
+  row.append(content);
+
+  const receipts = new Map();
+  if (recipients.length) {
+    const group = el("div", "message-receipts");
+    for (const recipient of recipients) {
+      const marker = el("span", "message-receipt", recipient);
+      marker.setAttribute("role", "img");
+      markRead(marker, recipient, false, autoMail);
+      receipts.set(recipient, marker);
+      group.append(marker);
+    }
+    row.append(group);
+  }
+  return {row, receipts};
+}
+
+function renderCommunications(agents) {
+  const list = $("communications-list");
+  const rewind = cursor < messageCursor;
+  const first = rewind ? messageCursor : messageCursor + 1;
+  const end = rewind ? cursor : cursor + 1;
+  const direction = rewind ? -1 : 1;
+  const autoMail = Boolean(chosen()?.automatic_mail);
+  let top, height;
+  for (let index = first; index !== end; index += direction) {
+    const frame = frames[index];
+    const {kind, name, agent, arguments: args, result} = frame.event;
+    if (kind === "mail") {
+      for (const [recipient, ids] of Object.entries(frame.event.deliveries)) {
+        for (const id of ids) {
+          const receipt = messageRows.get(id)?.receipts.get(recipient);
+          if (receipt) markRead(receipt, recipient, !rewind, true);
+        }
+      }
+    }
+    if (kind !== "tool") continue;
+    if (name === "readMyMessages") {
+      for (const message of result?.messages ?? []) {
+        const receipt = messageRows.get(message.id)?.receipts.get(agent);
+        if (receipt) markRead(receipt, agent, !rewind);
+      }
+    } else if ((name === "messageOtherAgent" || name === "messageAllOtherAgents")
+               && Array.isArray(result?.delivered_to)) {
+      // The send frame includes the message ID even when later snapshots roll it out of view.
+      const sender = frame.agents.find(candidate => candidate.id === agent);
+      const id = sender?.sent?.at(-1)?.id ?? "frame-" + frame.index;
+      if (top === undefined) {
+        top = list.scrollTop;
+        height = list.scrollHeight;
+      }
+      if (rewind) {
+        messageRows.get(id)?.row.remove();
+        messageRows.delete(id);
+      } else {
+        const view = messageRow(id, agent, result.delivered_to, args?.message ?? "", autoMail);
+        messageRows.set(id, view);
+        list.prepend(view.row);
+      }
+    }
+  }
+  messageCursor = cursor;
+  list.hidden = !messageRows.size;
+  $("communications-empty").hidden = Boolean(messageRows.size);
+  $("communications").hidden = agents.length < 2 && !messageRows.size;
+  if (top !== undefined) list.scrollTop = top <= 6 ? 0 : top + list.scrollHeight - height;
 }
 
 function createCard(id) {
@@ -268,13 +540,8 @@ function createCard(id) {
   const status = el("span", "agent-status");
   header.append(selector, status);
   const look = el("div", "look");
-  const bottom = el("div", "agent-bottom");
-  const sent = el("div", "messages");
-  const received = el("div", "messages");
-  const receivedTitle = el("h3");
-  bottom.append(el("h3", "", "Sent"), sent, receivedTitle, received);
-  card.append(header, look, bottom);
-  const view = {card, selector, avatar, status, look, bottom, sent, received, receivedTitle};
+  card.append(header, look);
+  const view = {card, selector, avatar, status, look};
   cards.set(id, view);
   return view;
 }
@@ -306,28 +573,23 @@ function renderAgents(agents, actor) {
     }
     view.selector.setAttribute("aria-pressed", focus === agent.id);
     view.selector.disabled = Boolean(renderer?.compactAgents);
-    view.look.hidden = view.bottom.hidden = Boolean(renderer?.compactAgents);
+    view.look.hidden = Boolean(renderer?.compactAgents || renderer?.sharedObservation);
     view.status.textContent = agent.status === "ready" && agent.last_action
       ? agent.last_action : agent.status;
-    view.receivedTitle.textContent = agent.unread ? "Received · " + agent.unread + " unread" : "Received";
-    for (const key of ["sent", "received"]) {
-      const signature = JSON.stringify(agent[key]);
-      if (view[key].dataset.signature !== signature) {
-        view[key].dataset.signature = signature;
-        view[key].replaceChildren(...messages(agent[key], key === "sent"));
-      }
-    }
     const signature = JSON.stringify(agent.last_look);
     if (signature === view.look.dataset.signature && view.renderer === renderer) return;
     view.look.dataset.signature = signature;
     view.renderer = renderer;
-    if (!agent.last_look) {
+    if (view.look.hidden) {
+      view.look.replaceChildren();
+    } else if (!agent.last_look) {
       view.look.replaceChildren(el("p", "", "Waiting for first look"));
     } else if (renderer?.drawLook) {
       const canvas = el("canvas");
       canvas.width = canvas.height = 156;
       canvas.setAttribute("role", "img");
-      canvas.setAttribute("aria-label", agent.last_look.grid?.join("\n") ?? "Last observation");
+      const visible = (agent.last_look.agents ?? []).map(({id, dx, dy}) => "Agent " + id + " at offset " + dx + ", " + dy);
+      canvas.setAttribute("aria-label", [agent.last_look.grid?.join("\n") ?? "Last observation", ...visible].join("\n"));
       renderer.drawLook(canvas, agent.last_look, colors[index]);
       const clue = agent.last_look.inscriptions?.join(" ");
       view.look.replaceChildren(canvas);
@@ -340,10 +602,12 @@ function renderAgents(agents, actor) {
 
 function describe(event) {
   const {kind, name, result, arguments: args} = event;
+  if (kind === "tool" && result?.error) {
+    return {title: name + " rejected", detail: result.error, short: name + " rejected"};
+  }
+  const levelAction = renderer?.describeAction?.(event);
+  if (levelAction) return levelAction;
   if (kind === "tool") {
-    if (result?.error) return {title: name + " rejected", detail: result.error, short: name + " rejected"};
-    const levelAction = renderer?.describeAction?.(event);
-    if (levelAction) return levelAction;
     if (["moveX", "moveY"].includes(name) && Number.isInteger(result?.moved)) {
       const {moved} = result;
       const direction = name === "moveX" ? ["left", "right"] : ["up", "down"];
@@ -375,8 +639,16 @@ function describe(event) {
     return {title: name, short: name};
   }
   if (kind === "request") return {title: "Model request failed", detail: event.error};
+  if (kind === "mail") return {title: "Messages delivered"};
   if (kind === "round") return {title: "Waiting for model replies"};
+  if (kind === "tick") return {title: event.messages[0] ?? "Mechanism advanced", detail: event.messages.slice(1).join(" ")};
   if (kind === "agent_stopped") return {title: "Agent stopped", detail: event.reason ?? "No tool call"};
+  if (kind === "agent_halted") return {title: "Agent returned no tool call",
+    detail: event.retry == null ? "Follow-up limit reached." : "Follow-up " + event.retry + " of " + event.max_retries + " on the next turn."};
+  if (kind === "thinking") return {title: "Agent thinking", detail: event.text};
+  if (kind === "pause") return {title: event.reason === "round_limit" ? "Paused at the round limit"
+    : event.reason === "error" ? "Paused on a model error" : "Run paused"};
+  if (kind === "resume") return {title: "Run resumed"};
   if (kind === "finish") return {title: labels[event.status] ?? event.status};
   return {title: "Run started"};
 }
@@ -391,11 +663,17 @@ function renderAction(frame) {
     actor.textContent = "Agent " + agent;
     actor.style.setProperty("--agent", agentColor(agent));
   }
-  $("event").textContent = description.title;
-  $("event-detail").textContent = description.detail ?? "";
+  const title = $("event");
+  title.textContent = title.title = description.title;
+  const detail = $("event-detail");
+  const nextDetail = description.detail ?? "";
+  if (detail.textContent !== nextDetail) {
+    detail.textContent = nextDetail;
+    detail.scrollTop = 0;
+  }
 
   const entries = roundActions.get(frame.round) ?? [];
-  $("round-flow").hidden = !entries.length;
+  $("round-flow").inert = !entries.length;
   if (!entries.length) return;
   $("round-label").textContent = "Round " + frame.round;
   const track = $("round-actions");
@@ -435,18 +713,36 @@ function isPlaying() {
 function render() {
   const run = chosen();
   const frame = frames[cursor];
+  const setup = !run && preview;
   $("title").textContent = run?.level_title ?? catalog.levels.find(level => level.id === selectedPuzzle)?.title
     ?? "Waiting for a run";
   $("run-caption").textContent = run
     ? (run.settings.model === "demo" ? "Scripted demo" : run.settings.model) + " · Seed " + run.settings.seed
-    : "Spectator view";
-  $("empty").hidden = Boolean(frame);
-  $("empty").textContent = run ? "Waiting for the first recorded frame…" : "No recordings for this puzzle yet.";
-  $("observation").hidden = !frame;
-  if (!frame || comparing) return;
+    : setup ? "Round 0 · Preview seed " + setup.seed : "Spectator view";
+  const showing = Boolean(frame && replayVisible);
+  const ready = Boolean(frame && !replayVisible);
+  $("empty").hidden = showing || Boolean(setup);
+  $("empty-message").textContent = run ? (ready ? "Recording ready." : "Waiting for the first recorded frame…")
+    : runs.some(item => item.settings.level === selectedPuzzle) ? "Choose a recording or start a run."
+    : "No recordings for this puzzle yet.";
+  $("open-replay").hidden = !ready;
+  $("observation").hidden = !showing && !setup;
+  if (comparing || managing) return;
+  for (const id of ["metrics", "current-action", "round-flow", "replay-controls", "record-details"]) {
+    $(id).hidden = Boolean(setup);
+  }
+  if (setup) {
+    $("agent-observation").hidden = $("communications").hidden = true;
+    renderWorld(setup);
+    renderAgents(setup.agents, null);
+    return;
+  }
+  if (!showing) return;
   renderMetrics(run, frame);
   renderWorld(frame);
+  renderAgentObservation();
   renderAgents(frame.agents, frame.event.kind === "tool" ? frame.event.agent : null);
+  renderCommunications(frame.agents);
   renderAction(frame);
   $("timeline").max = frames.length - 1;
   $("timeline").value = cursor;
@@ -460,7 +756,9 @@ function render() {
   $("position").textContent = (cursor + 1) + " / " + frames.length;
   $("record-details").textContent = [
     "Level v" + run.level_version, run.settings.agents + (run.settings.agents === 1 ? " agent" : " agents"),
-    run.settings.rounds + " round limit", frame.metrics.tool_calls + " tool calls",
+    (frame.round_limit ?? run.settings.rounds) + " round limit", frame.metrics.tool_calls + " tool calls",
+    ...(frame.metrics.halts == null || run.settings.model === "demo" ? []
+      : [frame.metrics.halts + (frame.metrics.halts === 1 ? " halt" : " halts")]),
     ...Object.entries(run.errors ?? {}).map(([id, error]) => "Agent " + id + " · " + error),
   ].join(" · ");
 }
@@ -477,10 +775,11 @@ function stepTo(index, animate = false) {
   animation = null;
   progress = 1;
   const frame = frames[cursor];
-  if (animate && !reducedMotion.matches && renderer?.supportsMotion && motionFor(frame)) {
+  const tween = animate && tweenDuration(frame);
+  if (tween) {
     progress = 0;
     const start = performance.now();
-    const duration = Math.min(360, 180 / Number($("speed").value));
+    const duration = tween / Number($("speed").value);
     const paint = time => {
       progress = Math.min(1, (time - start) / duration);
       renderWorld(frame);
@@ -498,11 +797,12 @@ function seek(index, animate = false) {
 }
 
 function schedulePlayback() {
-  if (playbackTimer !== null || comparing || !(replay || (follow && streaming))
+  if (playbackTimer !== null || comparing || managing || !(replay || (follow && streaming))
       || cursor >= frames.length - 1) return;
   const event = frames[cursor].event;
   const linger = ["look", "read", "submit"].includes(event.name) || event.name?.startsWith("message");
-  const duration = linger ? 650 : event.kind === "round" ? 140 : 310;
+  const delay = renderer?.playbackDelay?.(event) ?? (linger ? 650 : event.kind === "round" ? 140 : 310);
+  const duration = Math.max(delay, tweenDuration(frames[cursor]) + 45, bubbleFor(event) ? 1400 : 0);
   playbackTimer = setTimeout(() => {
     playbackTimer = null;
     if (cursor + 1 === frames.length - 1) replay = false;
@@ -511,14 +811,27 @@ function schedulePlayback() {
   }, duration / Number($("speed").value));
 }
 
+function playRecording() {
+  stopReplay();
+  follow = false;
+  replayVisible = true;
+  replay = frames.length !== 1;
+  if (frames.length) stepTo(0);
+  schedulePlayback();
+}
+
 $("puzzle").addEventListener("change", event => {
   requestedRun = null;
   $("launch-status").hidden = true;
   selectPuzzle(event.target.value);
 });
 $("runs").addEventListener("change", event => selectRun(event.target.value));
+$("open-replay").addEventListener("click", playRecording);
 $("run-demo").addEventListener("click", () => launch("demo"));
 $("run-model").addEventListener("click", () => launch("model"));
+$("continue-run").addEventListener("click", () => launch("continue"));
+$("pause-run").addEventListener("click", toggleRunPause);
+$("stop-run").addEventListener("click", stopRun);
 $("vision").addEventListener("change", render);
 $("timeline").addEventListener("input", event => seek(Number(event.target.value)));
 $("previous").addEventListener("click", () => seek(cursor - 1));
@@ -544,46 +857,199 @@ $("play").addEventListener("click", () => {
   }
 });
 
-function showCompare(value) {
-  comparing = value;
-  $("spectate").hidden = value;
-  $("compare").hidden = !value;
-  const active = $(value ? "compare-tab" : "spectate-tab");
-  const inactive = $(value ? "spectate-tab" : "compare-tab");
-  active.setAttribute("aria-current", "page");
-  inactive.removeAttribute("aria-current");
-  if (value) {
+function showPage(page) {
+  comparing = page === "compare";
+  managing = page === "recordings";
+  for (const tab of ["spectate", "compare", "recordings"]) {
+    $(tab === "recordings" ? "recordings-page" : tab).hidden = tab !== page;
+    if (tab === page) $(tab + "-tab").setAttribute("aria-current", "page");
+    else $(tab + "-tab").removeAttribute("aria-current");
+  }
+  if (comparing || managing) {
     stopReplay();
-    refreshFilters();
+    if (comparing) refreshFilters();
+    if (managing) renderRecordings();
   } else {
     render();
     schedulePlayback();
   }
 }
 
+function watchRun(run) {
+  selectPuzzle(run.settings.level, run.id);
+  showPage("spectate");
+  playRecording();
+}
+
+function openComment(run) {
+  commentRun = run.public_id ?? run.id;
+  const input = $("recording-comment");
+  input.maxLength = catalog.max_comment_length ?? 1000;
+  input.value = run.comment ?? "";
+  $("comment-error").hidden = true;
+  $("comment-destination").hidden = !(run.public_id || run.published_to_git);
+  $("comment-dialog").showModal();
+}
+
+function commentCell(cell, run) {
+  cell.className = "recording-comment";
+  if (run.comment) cell.append(el("p", "comment-text", run.comment));
+  if (catalog.can_launch) {
+    const edit = el("button", "button", run.comment ? "Edit comment" : "Add comment");
+    edit.type = "button";
+    edit.addEventListener("click", () => openComment(run));
+    cell.append(edit);
+  } else if (!run.comment) {
+    cell.textContent = "—";
+  }
+}
+
+$("comment-form").addEventListener("submit", async event => {
+  event.preventDefault();
+  if ($("save-comment").disabled) return;
+  const id = commentRun;
+  $("save-comment").disabled = $("cancel-comment").disabled = true;
+  $("comment-error").hidden = true;
+  try {
+    const result = await postRun("comment", {id, comment: $("recording-comment").value}, "Could not save the comment.");
+    for (const run of runs) {
+      if ((run.public_id ?? run.id) === id) run.comment = result.comment;
+    }
+    $("comment-dialog").close();
+    if (managing) renderRecordings();
+    if (comparing) renderComparison();
+  } catch (error) {
+    $("comment-error").textContent = error.message;
+    $("comment-error").hidden = false;
+  } finally {
+    $("save-comment").disabled = $("cancel-comment").disabled = false;
+  }
+});
+
+$("cancel-comment").addEventListener("click", () => $("comment-dialog").close());
+$("comment-dialog").addEventListener("cancel", event => {
+  if ($("save-comment").disabled) event.preventDefault();
+});
+
+async function setPublication(run, destination, enabled) {
+  if (recordingUpdates.has(run.id)) return;
+  if (destination === "git" && !window.confirm(
+    "Copy this recording into recordings/ for Git? The replay includes agent messages and any recorded thinking. "
+    + "You can review the files before committing them.")) return;
+  recordingUpdates.add(run.id);
+  renderRecordings();
+  const notice = $("publication-status");
+  notice.hidden = false;
+  notice.textContent = "Saving publication status…";
+  try {
+    await postRun("publish", {id: run.id, destination, enabled}, "Could not update publication.");
+    const current = runs.find(item => item.id === run.id);
+    if (current) current[destination === "git" ? "published_to_git" : "published_locally"] = enabled;
+    notice.textContent = destination === "git" ? "Ready to review and commit in recordings/" + run.id + "/."
+      : enabled ? "Published locally." : "Removed from local graphs.";
+  } catch (error) {
+    notice.textContent = error.message;
+  } finally {
+    recordingUpdates.delete(run.id);
+    if (managing) renderRecordings();
+  }
+}
+
+async function deleteRecording(run) {
+  if (recordingUpdates.has(run.id) || !window.confirm("Are you sure you want to delete this recording?")) return;
+  recordingUpdates.add(run.id);
+  renderRecordings();
+  const notice = $("publication-status");
+  notice.hidden = false;
+  notice.textContent = "Deleting recording…";
+  try {
+    await postRun("delete-recording", {id: run.id}, "Could not delete the recording.");
+    runs = runs.filter(item => item.id !== run.id);
+    updateRecordings();
+    notice.textContent = "Recording deleted.";
+  } catch (error) {
+    notice.textContent = error.message;
+  } finally {
+    recordingUpdates.delete(run.id);
+    if (managing) renderRecordings();
+  }
+}
+
+function renderRecordings() {
+  const container = $("recording-management");
+  const local = new Set(runs.filter(run => !run.public_id).map(run => run.id));
+  const recordings = runs.filter(run => !local.has(run.public_id));
+  if (!recordings.length) {
+    container.replaceChildren(el("p", "quiet", "No recordings yet."));
+    return;
+  }
+  const table = el("table");
+  const head = table.createTHead().insertRow();
+  for (const label of ["Recording", "Puzzle", "Result", "Comment", "Local graphs", "Git", "Actions"]) head.append(el("th", "", label));
+  const body = table.createTBody();
+  for (const run of recordings) {
+    const row = body.insertRow();
+    const watch = el("button", "button", runLabel(run));
+    watch.addEventListener("click", () => watchRun(run));
+    row.insertCell().append(watch);
+    row.insertCell().textContent = run.level_title;
+    row.insertCell().textContent = labels[run.status] ?? run.status;
+    commentCell(row.insertCell(), run);
+    const localCell = row.insertCell(), gitCell = row.insertCell();
+    const disabled = !catalog.can_launch || recordingUpdates.has(run.id) || ["running", "paused"].includes(run.status);
+    const demo = run.settings.model === "demo";
+    if (!run.public_id && (!demo || run.published_locally)) {
+      const toggle = el("button", "button", run.published_locally ? "Unpublish locally" : "Publish locally");
+      toggle.disabled = disabled;
+      toggle.addEventListener("click", () => setPublication(run, "local", !run.published_locally));
+      localCell.append(toggle);
+    } else {
+      localCell.textContent = "—";
+    }
+    if (run.public_id || run.published_to_git) {
+      gitCell.textContent = "In Git collection";
+    } else if (!demo) {
+      const copy = el("button", "button", "Publish to Git");
+      copy.disabled = disabled;
+      copy.addEventListener("click", () => setPublication(run, "git", true));
+      gitCell.append(copy);
+    } else {
+      gitCell.textContent = "—";
+    }
+    const actions = row.insertCell();
+    if (!run.public_id && !run.published_to_git) {
+      const remove = el("button", "button", "Delete");
+      remove.disabled = disabled;
+      remove.addEventListener("click", () => deleteRecording(run));
+      actions.append(remove);
+    }
+  }
+  container.replaceChildren(table);
+}
+
 const levelKey = run => [run.settings.level, run.level_version, run.harness_version].join("/");
 const recordedRuns = () => {
-  const type = $("run-type").value;
-  return runs.filter(run => run.status !== "running"
-    && (!type || (run.settings.model === "demo" ? "demo" : "model") === type));
+  const source = $("graph-source").value;
+  const visible = runs.filter(run => run.settings.model !== "demo" && run.status !== "running" && run.status !== "paused"
+    && (run.public_id ? source !== "local" : source !== "public" && run.published_locally));
+  const local = new Set(visible.filter(run => !run.public_id).map(run => run.id));
+  return visible.filter(run => !local.has(run.public_id));
 };
 
 function runMetric(run, field) {
-  if (run.settings.model === "demo" && (field.endsWith("_tokens") || field === "cost_usd")) return null;
   return run[field] ?? usage(run.metrics, field);
 }
 
 function refreshFilters() {
-  const levels = new Map(catalog.levels.map(level => [
-    [level.id, level.version, catalog.harness_version].join("/"),
-    level.title + " v" + level.version + " · Harness v" + catalog.harness_version,
-  ]));
-  for (const run of runs) {
+  const recordings = recordedRuns();
+  const levels = new Map();
+  for (const run of recordings) {
     levels.set(levelKey(run), run.level_title + " v" + run.level_version + " · Harness v" + run.harness_version);
   }
   const preferred = [...levels.keys()].find(key => key.startsWith(selectedPuzzle + "/"));
-  options($("level-filter"), levels.size ? [...levels] : [["", "No levels"]], preferred ?? levels.keys().next().value);
-  const seeds = [...new Set(recordedRuns().filter(run => levelKey(run) === $("level-filter").value)
+  options($("level-filter"), levels.size ? [...levels] : [["", "No published recordings"]], preferred ?? levels.keys().next().value);
+  $("level-filter").disabled = !levels.size;
+  const seeds = [...new Set(recordings.filter(run => levelKey(run) === $("level-filter").value)
     .map(run => run.settings.seed))].sort((a, b) => a - b);
   options($("seed-filter"), [["", "All seeds"], ...seeds.map(seed => [String(seed), String(seed)])]);
   renderComparison();
@@ -594,12 +1060,11 @@ function renderComparison() {
   const data = recordedRuns().filter(run => levelKey(run) === $("level-filter").value
     && (!seed || String(run.settings.seed) === seed));
   const metric = $("metric-filter").value;
-  const samples = data.filter(run => !["error", "interrupted"].includes(run.status))
-    .map(run => [run, runMetric(run, metric)])
+  const samples = data.map(run => [run, runMetric(run, metric)])
     .filter(([, value]) => value != null)
     .sort(([a], [b]) => a.settings.model.localeCompare(b.settings.model) || a.id.localeCompare(b.id));
   $("chart-note").textContent = !data.length
-    ? "No completed runs match these filters."
+    ? "No published runs match these filters."
     : !samples.length ? "No results are available for this metric."
     : "Each bar is one run. The table includes the seed, outcome and run settings.";
   const max = metric === "score" ? 1 : Math.max(0, ...samples.map(([, value]) => value));
@@ -611,16 +1076,17 @@ function renderComparison() {
     bar.style.width = (max ? 100 * value / max : 0) + "%";
     bar.style.setProperty("--agent", colors[models.indexOf(run.settings.model) % colors.length]);
     track.append(bar);
-    row.title = runLabel(run);
-    const model = run.settings.model === "demo" ? "Scripted demo" : run.settings.model;
-    row.append(el("span", "", model + " · " + run.settings.seed), track,
+    row.title = [runLabel(run), run.comment].filter(Boolean).join("\n");
+    const label = el("span", "", run.settings.model + " · " + run.settings.seed);
+    if (run.comment) label.append(el("small", "graph-comment", run.comment));
+    row.append(label, track,
       el("span", "bar-value", format(metric, value)));
     return row;
   }));
 
   const table = el("table");
   const head = table.createTHead().insertRow();
-  ["Run", "Model", "Provider", "Seed", "Result", "Score", "Elapsed", "Tokens", "API cost", "Setup"]
+  ["Run", "Model", "Provider", "Seed", "Result", "Score", "Halts", "Elapsed", "Tokens", "API cost", "Setup", "Comment"]
     .forEach(value => head.append(el("th", "", value)));
   const body = table.createTBody();
   for (const run of data) {
@@ -629,35 +1095,34 @@ function renderComparison() {
     const replayButton = el("button", "button", "Watch");
     replayButton.type = "button";
     replayButton.title = runLabel(run);
-    replayButton.addEventListener("click", () => {
-      selectPuzzle(run.settings.level, run.id);
-      showCompare(false);
-    });
+    replayButton.addEventListener("click", () => watchRun(run));
     row.insertCell().append(replayButton);
     const resolved = run.models?.join(", ");
     const values = [
-      settings.model === "demo" ? "Scripted demo"
-        : resolved && resolved !== settings.model ? settings.model + " → " + resolved : settings.model,
+      resolved && resolved !== settings.model ? settings.model + " → " + resolved : settings.model,
       run.providers?.join(", ") || "—",
       settings.seed,
       labels[run.status] ?? run.status,
       format("score", run.score),
+      format("halts", runMetric(run, "halts")),
       format("elapsed_seconds", run.elapsed_seconds),
       format("total_tokens", runMetric(run, "total_tokens")),
       format("cost_usd", runMetric(run, "cost_usd")),
       settings.agents + (settings.agents === 1 ? " agent" : " agents") + " · " + settings.rounds + " rounds"
-        + (settings.model === "demo" ? "" : " · " + settings.max_completion_tokens + " max reply tokens · "
-          + (settings.reasoning_effort ?? "default reasoning")),
+        + " · " + settings.max_completion_tokens + " max reply tokens · "
+        + (settings.reasoning_effort ?? "default reasoning"),
     ];
     values.forEach(value => row.append(el("td", "", value)));
+    commentCell(row.insertCell(), run);
   }
   $("history").replaceChildren(...(data.length ? [table] : []));
 }
 
-$("spectate-tab").addEventListener("click", () => showCompare(false));
-$("compare-tab").addEventListener("click", () => showCompare(true));
+$("spectate-tab").addEventListener("click", () => showPage("spectate"));
+$("compare-tab").addEventListener("click", () => showPage("compare"));
+$("recordings-tab").addEventListener("click", () => showPage("recordings"));
+$("graph-source").addEventListener("change", refreshFilters);
 $("level-filter").addEventListener("change", refreshFilters);
-$("run-type").addEventListener("change", refreshFilters);
 $("metric-filter").addEventListener("change", renderComparison);
 $("seed-filter").addEventListener("change", renderComparison);
 poll();

@@ -1,15 +1,26 @@
 import importlib
 import re
+from base64 import b64encode
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
 
 LEVELS = Path(__file__).resolve().parent.parent / "levels"
 
 
+@dataclass(frozen=True)
+class ImageObservation:
+    url: str
+
+    @classmethod
+    def png(cls, data):
+        return cls("data:image/png;base64," + b64encode(data).decode("ascii"))
+
+
 class Level(Protocol):
     tools: tuple[dict, ...]
 
-    def act(self, agent: str, name: str, arguments: dict) -> dict: ...
+    def act(self, agent: str, name: str, arguments: dict) -> dict | ImageObservation: ...
     def evaluate(self) -> tuple[bool, float]: ...
     def snapshot(self) -> dict: ...
 
@@ -53,6 +64,9 @@ def validate_arguments(definition, arguments):
                 return f"{name} must be an integer from {field['minimum']} to {field['maximum']}."
             if "enum" in field and value not in field["enum"]:
                 return f"{name} must be one of {', '.join(map(str, field['enum']))}."
+        elif field["type"] == "number":
+            if type(value) not in (int, float) or not field["minimum"] <= value <= field["maximum"]:
+                return f"{name} must be a number from {field['minimum']} to {field['maximum']}."
         elif field["type"] == "string":
             if not isinstance(value, str) or not 1 <= len(value) <= field["maxLength"]:
                 return f"{name} must contain 1 to {field['maxLength']} characters."

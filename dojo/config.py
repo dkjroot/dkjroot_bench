@@ -6,6 +6,15 @@ from dojo.level import load_level
 
 MODEL_ID = re.compile(r"[A-Za-z0-9][\w.-]*/[A-Za-z0-9][\w.-]*(?::[\w.-]+)?", re.ASCII)
 MODEL_ROUTERS = {"openrouter/auto", "openrouter/free", "openrouter/pareto-code", "openrouter/fusion"}
+GEMINI_MODEL_ID = re.compile(r"gemini-[a-z0-9]+(?:[.-][a-z0-9]+)*")
+BACKEND_KEYS = {"openrouter": "OPENROUTER_API_KEY", "gemini": "GEMINI_API_KEY"}
+DEFAULT_DEMO_ROUNDS = 160
+MAX_ROUNDS = 1000
+
+
+def validate_rounds(rounds):
+    if type(rounds) is not int or not 1 <= rounds <= MAX_ROUNDS:
+        raise ValueError(f"rounds must be an integer from 1 to {MAX_ROUNDS}.")
 
 
 @dataclass(frozen=True)
@@ -20,6 +29,10 @@ class Settings:
     provider: str | None = None
     reasoning_effort: str | None = None
     demo_delay: float = 0.14
+    backend: str = "openrouter"
+    gemini_input_tpm: int | None = None
+    gemini_rpm: int | None = None
+    gemini_thought_summaries: bool = False
 
     def __post_init__(self):
         if not isinstance(self.level, str):
@@ -28,9 +41,11 @@ class Settings:
         if self.agents is None:
             object.__setattr__(self, "agents", level.DEFAULT_AGENTS)
         if self.rounds is None:
-            object.__setattr__(self, "rounds", 160 if self.model == "demo" else 60)
+            rounds = DEFAULT_DEMO_ROUNDS if self.model == "demo" else getattr(level, "DEFAULT_MODEL_ROUNDS", 60)
+            object.__setattr__(self, "rounds", rounds)
+        validate_rounds(self.rounds)
         for name, lower, upper in (
-            ("agents", 1, 8), ("rounds", 1, 1000),
+            ("agents", 1, 8),
             ("max_completion_tokens", 1, 200_000), ("request_timeout", 1, 600),
         ):
             value = getattr(self, name)
@@ -39,11 +54,28 @@ class Settings:
         fixed_agents = getattr(level, "FIXED_AGENTS", None)
         if fixed_agents is not None and self.agents != fixed_agents:
             raise ValueError(f"{level.TITLE} requires {fixed_agents} agent.")
+        minimum_agents = getattr(level, "MIN_AGENTS", 1)
+        if self.agents < minimum_agents:
+            raise ValueError(f"{level.TITLE} requires at least {minimum_agents} agents.")
         if self.seed is not None and (type(self.seed) is not int or abs(self.seed) > 2**53 - 1):
             raise ValueError("seed must be an integer between -(2**53 - 1) and 2**53 - 1.")
         if type(self.demo_delay) not in (int, float) or not 0 <= self.demo_delay <= 5:
             raise ValueError("demo_delay must be a number from 0 to 5 seconds.")
-        if self.model != "demo":
+        if not isinstance(self.backend, str) or self.backend not in BACKEND_KEYS:
+            raise ValueError("backend must be openrouter or gemini.")
+        for name in ("gemini_input_tpm", "gemini_rpm"):
+            value = getattr(self, name)
+            if value is not None and (self.backend != "gemini" or type(value) is not int or value < 1):
+                raise ValueError(f"{name} requires a positive integer and the Gemini backend.")
+        if type(self.gemini_thought_summaries) is not bool or (self.gemini_thought_summaries and self.backend != "gemini"):
+            raise ValueError("gemini_thought_summaries requires the Gemini backend.")
+        if self.backend == "gemini":
+            if self.model != "demo" and (not isinstance(self.model, str)
+                                         or not GEMINI_MODEL_ID.fullmatch(self.model)):
+                raise ValueError("model must be demo or a Gemini API model ID such as gemini-3.1-flash-lite.")
+            if self.provider is not None or self.reasoning_effort is not None:
+                raise ValueError("provider and reasoning_effort settings require the OpenRouter backend.")
+        elif self.model != "demo":
             if not isinstance(self.model, str) or not MODEL_ID.fullmatch(self.model):
                 raise ValueError("model must be demo or a concrete OpenRouter model ID.")
             model, _, variant = self.model.lower().partition(":")

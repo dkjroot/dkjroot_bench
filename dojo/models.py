@@ -13,6 +13,21 @@ class NoRedirect(HTTPRedirectHandler):
         return None
 
 
+def read_json(incoming):
+    raw = incoming.read(MAX_REPLY_BYTES + 1)
+    if len(raw) > MAX_REPLY_BYTES:
+        raise ValueError("Response exceeds the size limit.")
+    response = decode(raw)
+    if not isinstance(response, dict):
+        raise ValueError("Expected a JSON object.")
+    return response
+
+
+def request_json(request, timeout):
+    with build_opener(NoRedirect).open(request, timeout=timeout) as incoming:
+        return read_json(incoming)
+
+
 @dataclass
 class Reply:
     message: dict | None
@@ -23,6 +38,9 @@ class Reply:
     seconds: float = 0
     finish_reason: str | None = None
     error: str | None = None
+    native_content: dict | None = None
+    rate_limit_retries: int = 0
+    thought_summary: str | None = None
 
 
 class OpenRouter:
@@ -55,13 +73,7 @@ class OpenRouter:
         started = monotonic()
         response = {}
         try:
-            with build_opener(NoRedirect).open(request, timeout=settings.request_timeout) as incoming:
-                raw = incoming.read(MAX_REPLY_BYTES + 1)
-            if len(raw) > MAX_REPLY_BYTES:
-                raise ValueError("Response exceeds the size limit.")
-            response = decode(raw)
-            if not isinstance(response, dict):
-                raise ValueError("Expected a JSON object.")
+            response = request_json(request, settings.request_timeout)
             if response.get("error"):
                 error = response["error"]
                 raise ValueError(error.get("message", "Provider error") if isinstance(error, dict)

@@ -1,32 +1,11 @@
+import {drawBubble, drawSprite} from "/agent-sprites.js";
+export {drawAgent} from "/agent-sprites.js";
+
 export const supportsSight = true;
 export const supportsMotion = true;
 
 const mint = "#8df0d7";
 const amber = "#f8b279";
-const ink = "#07111d";
-
-// Rocket, rover, diamond, dome, walker, glider, shield and twin pod.
-const silhouettes = [
-  "M0 -24 9 -16 13 -5 13 7 18 13 18 19 8 14 5 21H-5L-8 14-18 19V13L-13 7V-5L-9 -16Z",
-  "M-20 -9H-13V-16H13V-9H20V14L15 18H-15L-20 14Z",
-  "M0 -23 20 -3V3L0 23-20 3V-3Z",
-  "M-21 -10H-14Q0 -28 14 -10H21V-1H16Q19 12 9 18H-9Q-19 12 -16 -1H-21Z",
-  "M-3 -24H3V-18H10L14 -12V13H9V22H3V14H-3V22H-9V13H-14V-12L-10 -18H-3Z",
-  "M-22 -18 -8 -10 0 -17 8 -10 22 -18V3L13 12H5L0 22-5 12H-13L-22 3Z",
-  "M-19 -15H7L18 -22V8L11 16 0 22-11 16-19 7Z",
-  "M-21 -18H-10L-5 -12H5L10 -18H21V1H16V14H10V20H-10V14H-16V1H-21Z",
-].map(path => new Path2D(path));
-
-const numbers = [
-  ["010", "110", "010", "010", "111"],
-  ["111", "001", "111", "100", "111"],
-  ["111", "001", "111", "001", "111"],
-  ["101", "101", "111", "001", "001"],
-  ["111", "100", "111", "001", "111"],
-  ["111", "100", "111", "101", "111"],
-  ["111", "001", "010", "010", "010"],
-  ["111", "101", "111", "101", "111"],
-];
 
 function glyph(ctx, mark, x, y, radius, color, width) {
   ctx.strokeStyle = color;
@@ -44,59 +23,7 @@ function glyph(ctx, mark, x, y, radius, color, width) {
   ctx.stroke();
 }
 
-function sprite(ctx, id, x, y, color, active, stride = 0) {
-  const index = Number(id) - 1;
-  ctx.save();
-  ctx.translate(Math.round(x), Math.round(y));
-  ctx.fillStyle = ink;
-  ctx.beginPath();
-  ctx.ellipse(0, 20, 17, 5, 0, 0, Math.PI * 2);
-  ctx.fill();
-  if (active) {
-    ctx.beginPath();
-    for (const dx of [-1, 1]) {
-      for (const dy of [-1, 1]) {
-        ctx.moveTo(dx * 19, dy * 27);
-        ctx.lineTo(dx * 27, dy * 27);
-        ctx.lineTo(dx * 27, dy * 19);
-      }
-    }
-    ctx.lineJoin = "round";
-    ctx.strokeStyle = ink;
-    ctx.lineWidth = 5;
-    ctx.stroke();
-    ctx.strokeStyle = "#fff";
-    ctx.lineWidth = 2.5;
-    ctx.stroke();
-  }
-
-  ctx.translate(0, -Math.round(2 * Math.sin(stride * Math.PI)));
-  ctx.lineJoin = "round";
-  ctx.strokeStyle = ink;
-  ctx.lineWidth = 4;
-  const body = silhouettes[index];
-  ctx.stroke(body);
-  ctx.fillStyle = color;
-  ctx.fill(body);
-  ctx.fillStyle = ink;
-  ctx.fillRect(-7, -11, 4, 3);
-  ctx.fillRect(3, -11, 4, 3);
-  ctx.fillRect(-8, -5, 16, 20);
-  ctx.fillStyle = "#fff";
-  numbers[index].forEach((row, y) => {
-    for (let x = 0; x < row.length; x++) {
-      if (row[x] === "1") ctx.fillRect(-4 + x * 3, -2 + y * 3, 3, 3);
-    }
-  });
-  ctx.restore();
-}
-
-export function drawAgent(canvas, id, color) {
-  const ctx = canvas.getContext("2d");
-  sprite(ctx, id, canvas.width / 2, canvas.height / 2, color, false);
-}
-
-export function drawWorld(canvas, world, {color, focus, sight, actor, move}) {
+export function drawWorld(canvas, world, {color, focus, sight, actor, move, bubble}) {
   const ctx = canvas.getContext("2d");
   const size = canvas.width;
   const inset = 29;
@@ -106,9 +33,8 @@ export function drawWorld(canvas, world, {color, focus, sight, actor, move}) {
   const center = value => edge(value + 0.5);
   const players = world.players.map(player => {
     if (!move || player.id !== actor) return player;
-    const ease = 1 - (1 - move.progress) ** 2;
-    return {...player, x: move.from.x + (player.x - move.from.x) * ease,
-      y: move.from.y + (player.y - move.from.y) * ease};
+    return {...player, x: move.from.x + (player.x - move.from.x) * move.progress,
+      y: move.from.y + (player.y - move.from.y) * move.progress};
   });
   ctx.clearRect(0, 0, size, size);
   ctx.fillStyle = "#09121d";
@@ -210,16 +136,27 @@ export function drawWorld(canvas, world, {color, focus, sight, actor, move}) {
 
   const ordered = [...players].sort((a, b) => Number(a.id === actor) - Number(b.id === actor));
   const keepVisible = (coordinate, margin) => Math.max(margin, Math.min(size - margin, coordinate));
-  for (const player of ordered) {
-    const group = players.filter(other => other.x === player.x && other.y === player.y);
-    const onPiece = world.pieces.some(piece => piece.x === player.x && piece.y === player.y);
+  function position(player, state) {
+    const group = state.players.filter(other => other.x === player.x && other.y === player.y);
+    const onPiece = state.pieces.some(piece => piece.x === player.x && piece.y === player.y);
     const angle = group.indexOf(player) * (2 * Math.PI / group.length) - Math.PI / 4;
     const shift = group.length > 1 ? Math.max(onPiece ? 34 : 0, 19 / Math.sin(Math.PI / group.length))
       : onPiece ? 33 : 0;
+    return [keepVisible(center(player.x), 30 + shift) + shift * Math.cos(angle),
+      keepVisible(center(player.y), 30 + shift) + shift * Math.sin(angle)];
+  }
+  let speaker;
+  for (const player of ordered) {
+    const endpoint = world.players.find(candidate => candidate.id === player.id);
     const baseX = center(player.x), baseY = center(player.y);
-    const x = keepVisible(baseX, 30 + shift) + shift * Math.cos(angle);
-    const y = keepVisible(baseY, 30 + shift) + shift * Math.sin(angle);
-    if (shift) {
+    let [x, y] = position(endpoint, world);
+    if (move) {
+      const start = move.world.players.find(candidate => candidate.id === player.id) ?? endpoint;
+      const [startX, startY] = position(start, move.world);
+      x = startX + (x - startX) * move.progress;
+      y = startY + (y - startY) * move.progress;
+    }
+    if (Math.hypot(x - baseX, y - baseY) > 1) {
       ctx.beginPath();
       ctx.strokeStyle = color(player.id);
       ctx.lineWidth = 1.5;
@@ -227,8 +164,10 @@ export function drawWorld(canvas, world, {color, focus, sight, actor, move}) {
       ctx.lineTo(x, y);
       ctx.stroke();
     }
-    sprite(ctx, player.id, x, y, color(player.id), actor === player.id,
-      actor === player.id ? move?.progress : 0);
+    drawSprite(ctx, player.id, x, y, color(player.id), {
+      active: actor === player.id, stride: actor === player.id ? move?.progress : 0,
+    });
+    if (bubble?.agent === player.id) speaker = [x, y - 26];
     if (player.carrying) {
       ctx.fillStyle = "#09131f";
       ctx.beginPath();
@@ -238,6 +177,7 @@ export function drawWorld(canvas, world, {color, focus, sight, actor, move}) {
         player.carrying === "X" ? mint : amber, 1.8);
     }
   }
+  if (speaker) drawBubble(ctx, ...speaker, bubble, color(bubble.agent));
 }
 
 export function drawLook(canvas, observation, color) {
@@ -267,4 +207,24 @@ export function drawLook(canvas, observation, color) {
   ctx.strokeStyle = color;
   ctx.lineWidth = 1.2;
   ctx.strokeRect(padding + mid * step - 0.5, padding + mid * step - 0.5, step, step);
+  const markers = new Map();
+  for (const {id, dx, dy} of observation.agents ?? []) {
+    const key = dx + "," + dy;
+    if (!markers.has(key)) markers.set(key, []);
+    markers.get(key).push(id);
+  }
+  ctx.font = "bold 8px system-ui, sans-serif";
+  ctx.textAlign = "center";
+  ctx.textBaseline = "middle";
+  for (const [key, ids] of markers) {
+    const [dx, dy] = key.split(",").map(Number);
+    const x = padding + (mid + dx + 0.5) * step;
+    const y = padding + (mid + dy + 0.5) * step;
+    ctx.fillStyle = "#10202d";
+    ctx.beginPath();
+    ctx.arc(x, y, step / 2, 0, 2 * Math.PI);
+    ctx.fill();
+    ctx.fillStyle = "#e7f3fb";
+    ctx.fillText(ids.join(","), x, y, step - 1);
+  }
 }

@@ -4,7 +4,7 @@ from functools import lru_cache
 from dojo.level import tool
 
 TITLE = "Glass Tic-Tac-Toe"
-VERSION = 2
+VERSION = 5
 GOAL = "Solve the puzzle."
 DEFAULT_AGENTS = 4
 MAX_CALLS_PER_TURN = 1
@@ -15,7 +15,12 @@ MIN_BOARD, MAX_BOARD = 6, 22
 LINES = (11, 17)
 CENTERS = (8, 14, 20)
 SIGN = "X must win. Leave a position that could occur in a game."
-SIGN_CELLS = {(x, 26) for x in range(9, 20)}
+SIGN_Y = 26
+SIGN_COLUMNS = range(9, 20)
+SIGN_CELLS = {
+    (x, SIGN_Y): SIGN[i * len(SIGN) // len(SIGN_COLUMNS):(i + 1) * len(SIGN) // len(SIGN_COLUMNS)]
+    for i, x in enumerate(SIGN_COLUMNS)
+}
 STRIDE = 3
 STEPS = {"type": "integer", "minimum": -STRIDE, "maximum": STRIDE,
          "enum": [step for step in range(-STRIDE, STRIDE + 1) if step]}
@@ -28,11 +33,9 @@ TOOLS = (
          steps=STEPS),
     tool("look", "Read a circular grid centred under you. Row and column offsets are relative "
          "to your current spot, with positive offsets down and right. A space is outside your "
-         "view, # is beyond the floor, . is bare floor, + is a painted line, ! is an inscription, "
-         "and any other marks are loose objects. Any readable inscriptions are returned as text."),
+         "view, # is beyond the floor, and . is bare floor."),
     tool("lift", "Pick up the loose object directly under you. You can carry one object."),
-    tool("drop", "Put the object you are carrying directly under you. The spot must be empty "
-         "and free of paint and inscriptions."),
+    tool("drop", "Put the object you are carrying directly under you."),
 )
 
 WIN_LINES = (
@@ -114,7 +117,7 @@ class Puzzle:
             return {"moved": after - before}
         if name == "look":
             rows = []
-            visible_sign = False
+            visible_text = []
             for dy in range(-RADIUS, RADIUS + 1):
                 row = []
                 for dx in range(-RADIUS, RADIUS + 1):
@@ -125,13 +128,18 @@ class Puzzle:
                         row.append("#")
                     elif point in SIGN_CELLS:
                         row.append("!")
-                        visible_sign = True
+                        visible_text.append(SIGN_CELLS[point])
                     else:
                         row.append(self.pieces.get(point, "+" if painted(*point) else "."))
                 rows.append("".join(row))
-            view = {"grid": rows, "carrying": self.hands[agent]}
-            if visible_sign:
-                view["inscriptions"] = [SIGN]
+            visible_agents = [
+                {"id": other, "dx": other_x - x, "dy": other_y - y}
+                for other, (other_x, other_y) in self.positions.items()
+                if other != agent and (other_x - x) ** 2 + (other_y - y) ** 2 <= RADIUS ** 2
+            ]
+            view = {"grid": rows, "carrying": self.hands[agent], "agents": visible_agents}
+            if visible_text:
+                view["inscriptions"] = ["".join(visible_text)]
             return view
         if name == "lift":
             if self.hands[agent] is not None:
@@ -168,7 +176,7 @@ class Puzzle:
             "board": [MIN_BOARD, MAX_BOARD],
             "lines": LINES,
             "sign": SIGN,
-            "sign_y": 26,
+            "sign_y": SIGN_Y,
             "pieces": [{"x": x, "y": y, "mark": mark}
                        for (x, y), mark in self.pieces.items()],
             "players": [{"id": agent, "x": x, "y": y, "carrying": self.hands[agent]}
@@ -254,7 +262,6 @@ def demo(puzzle):
 
     wait_for_team()
     if len(ids) > 1:
-        add(board_scout, "readMyMessages")
         assignments = "; ".join(
             f"{agent} takes " + " and ".join(f"{mark} to {square}" for mark, _, _, square in deliveries)
             for agent, deliveries in jobs.items() if deliveries
@@ -263,9 +270,6 @@ def demo(puzzle):
                "Sounds like tic-tac-toe. Let's put three Xs across the top and two Os below. "
                + assignments + ".")
         wait_for_team()
-        for agent, deliveries in jobs.items():
-            if deliveries and agent != board_scout:
-                add(agent, "readMyMessages")
 
     for agent, deliveries in jobs.items():
         for mark, source, target, square in deliveries:

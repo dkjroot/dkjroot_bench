@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from dojo.level import tool
 
 TITLE = "Word Jumble"
-VERSION = 2
+VERSION = 4
 GOAL = "Submit the correct answer."
 DEFAULT_AGENTS = FIXED_AGENTS = 1
 USE_COMMUNICATION = False
@@ -17,31 +17,9 @@ TOOLS = (
          answer={"type": "string", "minLength": 1, "maxLength": 500}),
 )
 
-# Each sentence's initials spell an English word in its intended order.
-SENTENCES = (
-    "Ben rarely interrupts during group exercises.",
-    "Bakers rarely eat all desserts.",
-    "Cats are surprisingly tolerant little explorers.",
-    "Cats rarely obey whispered names.",
-    "Four old radios entertained some tourists.",
-    "Fresh lemons add more excitement.",
-    "Gardeners appreciate rich dirt every November.",
-    "Lena always needs time, especially right now.",
-    "Lucy enjoys making oat noodles.",
-    "My aunt prefers lemon extract.",
-    "Owls can easily avoid nets.",
-    "People always prefer easier routes.",
-    "People enjoy a relaxed lunch.",
-    "Peter enjoys new challenges in life.",
-    "Please leave a note explaining this.",
-    "Sam has eaten leftover lasagne.",
-    "Sam invited Lucy via email recently.",
-    "Several people ran into nearby gardens.",
-    "She thought Oliver needed encouragement.",
-    "The rabbits are indoors now.",
-)
-
 CRYPTIC_CLUES = (
+    ("Bird from crowd with its tail cut off.", "crow",
+     "Cut the last letter off CROWD to get CROW, a bird."),
     ("Quiet when listen is scrambled.", "silent",
      "Scramble LISTEN to get SILENT, meaning quiet."),
     ("Metal found in bright inlay.", "tin",
@@ -63,25 +41,21 @@ CRYPTIC_CLUES = (
 )
 
 
-def initials(words):
-    return "".join(word[0] for word in words)
-
-
 @dataclass(frozen=True)
 class Stage:
     clue: str
     answer: str
     words: tuple[str, ...]
-    explanation: str | None
+    explanation: str
 
 
-def shuffle_stage(rng, clue, answer=None, explanation=None):
+def shuffle_stage(rng, clue, answer, explanation):
     ordered = re.findall(r"[a-z]+", clue.lower())
     shuffled = ordered.copy()
     rng.shuffle(shuffled)
-    if shuffled == ordered or (answer is None and initials(shuffled) == initials(ordered)):
+    if shuffled == ordered:
         shuffled[0], shuffled[1] = shuffled[1], shuffled[0]
-    return Stage(clue, answer or initials(ordered), tuple(shuffled), explanation)
+    return Stage(clue, answer, tuple(shuffled), explanation)
 
 
 class Puzzle:
@@ -89,10 +63,7 @@ class Puzzle:
 
     def __init__(self, seed, agents):
         rng = random.Random(seed)
-        self.stages = (
-            shuffle_stage(rng, rng.choice(SENTENCES)),
-            *(shuffle_stage(rng, *clue) for clue in CRYPTIC_CLUES),
-        )
+        self.stages = tuple(shuffle_stage(rng, *clue) for clue in CRYPTIC_CLUES)
         self.completed = 0
 
     @property
@@ -113,14 +84,7 @@ class Puzzle:
             feedback = ("Success. All ten puzzles are solved." if self.completed == len(self.stages)
                         else "Success. Next puzzle is available.")
             return {"correct": True, "feedback": feedback}
-        single_word = re.fullmatch(r"[a-z]+", answer) is not None
-        if len(answer) > len(expected):
-            feedback = "Too long." if single_word else "Too long. Submit a single word."
-        elif not single_word:
-            feedback = "Submit a single word."
-        else:
-            feedback = "Incorrect."
-        return {"correct": False, "feedback": feedback}
+        return {"correct": False, "feedback": "Incorrect."}
 
     def evaluate(self):
         total = len(self.stages)
@@ -146,7 +110,6 @@ def demo(puzzle):
     for index, stage in enumerate(puzzle.stages):
         actions.append(("read", {}))
         if index == 0:
-            actions.append(("submit", {"answer": stage.clue}))
-            actions.append(("submit", {"answer": initials(stage.words)}))
+            actions.append(("submit", {"answer": "crowd"}))
         actions.append(("submit", {"answer": stage.answer}))
     return {"1": actions}

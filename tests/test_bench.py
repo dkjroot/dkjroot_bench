@@ -8,7 +8,7 @@ from unittest.mock import Mock, patch
 
 from dojo.config import Settings
 from dojo.models import OpenRouter, Reply
-from dojo.runner import Run
+from dojo.runner import CONTINUE_PROMPT, Run
 from dojo.storage import frames
 from levels.glass_tic_tac_toe import Puzzle, RADIUS, SIGN, SIZE, score_board
 
@@ -26,7 +26,8 @@ class LevelTests(unittest.TestCase):
         puzzle = Puzzle(42, ["1"])
         puzzle.positions["1"] = (0, 0)
         view = puzzle.act("1", "look", {})
-        self.assertEqual(set(view), {"grid", "carrying"})
+        self.assertEqual(set(view), {"grid", "carrying", "agents"})
+        self.assertEqual(view["agents"], [])
         self.assertEqual(len(view["grid"]), 2 * RADIUS + 1)
         self.assertEqual(view["grid"][0][0], " ")
         self.assertEqual(view["grid"][RADIUS][RADIUS - 1], "#")
@@ -44,6 +45,19 @@ class LevelTests(unittest.TestCase):
         self.assertEqual(score_board("XXX......"), (False, 0.6))
         self.assertFalse(score_board("XXXOOO...")[0])
         self.assertFalse(score_board("XXXOO.?..")[0])
+
+    def test_sign_text_is_clipped_to_cells_inside_the_sight_circle(self):
+        puzzle = Puzzle(42, ["1"])
+        puzzle.positions["1"] = (9, 20)
+        look = puzzle.act("1", "look", {})
+        self.assertEqual(look["inscriptions"], [SIGN[:len(SIGN) // 11]])
+        self.assertEqual(look["grid"][-1].count("!"), 1)
+        puzzle.positions["1"] = (19, 20)
+        look = puzzle.act("1", "look", {})
+        self.assertEqual(look["inscriptions"], [SIGN[10 * len(SIGN) // 11:]])
+        self.assertEqual(look["grid"][-1].count("!"), 1)
+        puzzle.positions["1"] = (9, 19)
+        self.assertNotIn("inscriptions", puzzle.act("1", "look", {}))
 
 
 class HarnessTests(unittest.TestCase):
@@ -66,6 +80,23 @@ class HarnessTests(unittest.TestCase):
                 self.assertEqual(rest[-1]["event"]["kind"], "finish")
                 self.assertEqual(len(first[0]["agents"]), count)
                 self.assertEqual(len({(p["x"], p["y"]) for p in first[0]["world"]["players"]}), count)
+
+    def test_interrupt_before_model_dispatch_skips_requests(self):
+        stop = Event()
+        backend = Mock()
+        run = Run(Settings(model="example/model", seed=42), self.root, stop, backend)
+        frame = run.frame
+
+        def interrupt(kind, **event):
+            frame(kind, **event)
+            if kind == "round":
+                stop.set()
+
+        with patch.object(run, "frame", side_effect=interrupt):
+            summary = run.execute()
+        backend.complete.assert_not_called()
+        self.assertEqual(summary["status"], "interrupted")
+        self.assertEqual(summary["metrics"]["requests"], 0)
 
     def test_demo_reports_local_clues_before_it_attempts_a_solution(self):
         run = Run(Settings(seed=42, demo_delay=0), self.root, Event())
@@ -112,16 +143,21 @@ class HarnessTests(unittest.TestCase):
         self.assertEqual(one.history, [{"role": "user", "content": "Solve the puzzle."}])
         run.apply_reply(one, reply(call("look", "{}"), reasoning_details=[{"id": "private"}]))
         run.apply_reply(one, reply(call("messageOtherAgent", '{"agent":"2","message":"hello"}')))
-        run.apply_reply(two, reply(call("readMyMessages", "{}")))
-        run.apply_reply(three, reply(call("readMyMessages", "{}")))
-        self.assertEqual(json.loads(two.history[-1]["content"])["messages"][0]["text"], "hello")
-        self.assertEqual(json.loads(three.history[-1]["content"]), {"messages": []})
+        self.assertEqual(len(two.history), 1)
+        run.deliver_mail(run.agents.values())
+        self.assertEqual(two.history[-1]["role"], "user")
+        self.assertEqual(json.loads(two.history[-1]["content"]), {"messages": [{"from": "1", "text": "hello"}]})
+        self.assertEqual(len(three.history), 1)
         self.assertEqual(one.history[1]["reasoning_details"], [{"id": "private"}])
         self.assertNotIn("private", json.dumps(two.history))
         self.assertNotIn("grid", json.dumps(two.history))
         batch, _ = frames(run.record.directory, 0)
         self.assertNotIn("private", json.dumps(batch))
-        self.assertEqual(run.dispatch(two, "readMyMessages", {}), {"messages": []})
+        self.assertEqual(batch[-1]["event"], {"kind": "mail", "deliveries": {"2": [1]}})
+        self.assertNotIn("readMyMessages", run.definitions)
+        run.deliver_mail(run.agents.values())
+        self.assertEqual(len(two.history), 2)
+        self.assertEqual(run.metrics["tool_calls"], 2)
 
     def test_untrusted_tool_arguments_cannot_change_world(self):
         run = Run(Settings(seed=42), self.root, Event())
@@ -158,11 +194,44 @@ class HarnessTests(unittest.TestCase):
         agent = run.agents["1"]
         before = run.puzzle.snapshot()
         run.apply_reply(agent, reply(content='{"name":"moveX","arguments":{"steps":3}}'))
-        self.assertEqual(agent.status, "stopped")
+        self.assertEqual(agent.status, "ready")
+        self.assertEqual(run.metrics["halts"], 1)
         run.apply_reply(agent, reply(call("moveX", '{"steps":3}'),
                                      call("moveY", '{"steps":3}')))
         self.assertEqual(agent.status, "error")
         self.assertEqual(run.puzzle.snapshot(), before)
+
+    def test_halt_follow_ups_reset_after_a_tool_and_visible_agents_reach_the_model(self):
+        settings = Settings(model="example/model", seed=42, agents=4, rounds=10)
+        run = Run(settings, self.root, Event(), OpenRouter("test-key", settings))
+        run.puzzle.positions.update({"1": (10, 10), "2": (16, 10), "3": (16, 11), "4": (10, 10)})
+        for agent in list(run.agents.values())[1:]:
+            agent.status = "stopped"
+        requests = []
+
+        def respond(request, timeout):
+            history = json.loads(request.data)["messages"]
+            requests.append(history)
+            number = len(requests)
+            message = {"tool_calls": [call("look", "{}")]} if number in (1, 3) else {"content": ""}
+            return io.BytesIO(json.dumps({"choices": [{"message": message, "finish_reason": "stop"}]}).encode())
+
+        with patch("dojo.models.build_opener") as opener:
+            opener.return_value.open.side_effect = respond
+            summary = run.execute()
+
+        observation = json.loads(requests[1][-1]["content"])
+        self.assertEqual(observation["agents"], [{"id": "2", "dx": 6, "dy": 0}, {"id": "4", "dx": 0, "dy": 0}])
+        self.assertEqual(set(observation), {"grid", "carrying", "agents"})
+        for index in (2, 4, 5, 6):
+            self.assertEqual(requests[index][-1], {"role": "user", "content": CONTINUE_PROMPT})
+        self.assertEqual(summary["status"], "agents_stopped")
+        self.assertEqual(summary["rounds"], 7)
+        self.assertEqual(summary["metrics"]["halts"], 5)
+        self.assertEqual(summary["metrics"]["tool_calls"], 2)
+        replay, _ = frames(run.record.directory, 0)
+        self.assertEqual([frame["event"]["retry"] for frame in replay if frame["event"]["kind"] == "agent_halted"],
+                         [1, 1, 2, 3, None])
 
     def test_multiple_moves_in_one_reply_are_rejected_and_agent_can_retry(self):
         run = Run(Settings(seed=42), self.root, Event())

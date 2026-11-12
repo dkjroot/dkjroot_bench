@@ -4,7 +4,7 @@ import argparse
 import os
 from pathlib import Path
 
-from dojo.config import Settings
+from dojo.config import BACKEND_KEYS, Settings
 from dojo.launcher import Launcher
 from dojo.level import available_levels
 from dojo.viewer import serve
@@ -16,7 +16,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", type=Path, help="configuration from ./configure")
     parser.add_argument("--level", choices=available_levels(), help="choose the puzzle for the initial run")
-    parser.add_argument("--demo", action="store_true", help="use the offline demo with these settings")
+    parser.add_argument("--demo", action="store_true", help="enable offline demos and use a demo for the initial run")
     parser.add_argument("--runs-dir", type=Path, default=PROJECT / "runs")
     parser.add_argument("--port", type=int, default=8765)
     mode = parser.add_mutually_exclusive_group()
@@ -29,10 +29,11 @@ def main():
 
     try:
         settings = Settings.read(path) if path else Settings()
-        launcher = Launcher(settings, args.runs_dir, os.environ.get("OPENROUTER_API_KEY"))
+        launcher = Launcher(settings, args.runs_dir, os.environ.get(BACKEND_KEYS[settings.backend]),
+                            interactive=not args.no_viewer, allow_demo=args.demo)
         args.runs_dir.mkdir(parents=True, exist_ok=True)
         if not args.no_viewer:
-            server = serve(args.runs_dir, args.port, launcher)
+            server = serve(args.runs_dir, args.port, launcher, autoplay_latest=not args.serve)
             print(f"Spectator view at http://127.0.0.1:{server.server_port} · Ctrl+C to stop",
                   flush=True)
         if not args.serve:
@@ -47,7 +48,7 @@ def main():
         parser.error(str(error))
     except KeyboardInterrupt:
         if launcher:
-            launcher.stop.set()
+            launcher.shutdown()
             if launcher.active_run:
                 print("\nFinishing any in-flight requests and saving the run…", flush=True)
                 launcher.wait()

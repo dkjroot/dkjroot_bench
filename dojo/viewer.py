@@ -1,12 +1,16 @@
 import json
+from secrets import randbits
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from threading import Lock
 from urllib.parse import parse_qs, urlsplit
 
+from dojo.config import DEFAULT_DEMO_ROUNDS, MAX_ROUNDS, Settings
 from dojo.launcher import RunBusy
 from dojo.level import LEVELS, available_levels, load_level
-from dojo.runner import HARNESS_VERSION
-from dojo.storage import RUN_ID, frames, summaries
+from dojo.publication import MAX_COMMENT_LENGTH, delete_recording, publish, recording_directory, recording_lists, save_comment
+from dojo.runner import Agent, HARNESS_VERSION
+from dojo.storage import RUN_ID, frames
 from dojo.wire import decode
 
 WEB = Path(__file__).resolve().parent.parent / "web"
@@ -14,10 +18,17 @@ STATIC = {
     "/": ("index.html", "text/html; charset=utf-8"),
     "/style.css": ("style.css", "text/css; charset=utf-8"),
     "/app.js": ("app.js", "text/javascript; charset=utf-8"),
+    "/agent-sprites.js": ("agent-sprites.js", "text/javascript; charset=utf-8"),
 }
 
 
-def serve(root, port, launcher=None):
+def serve(root, port, launcher=None, *, autoplay_latest=False, public_root=None):
+    public_root = public_root if public_root is not None else WEB.parent / "recordings"
+    if root.resolve() == public_root.resolve():
+        raise ValueError("Use a separate runs directory for private recordings.")
+    settings = launcher.settings if launcher else Settings()
+    preview_seed = settings.seed if settings.seed is not None else randbits(48)
+    recording_updates = Lock()
     levels = []
     for name in available_levels():
         level = load_level(name)
@@ -54,33 +65,79 @@ def serve(root, port, launcher=None):
             )
 
         def do_POST(self):
-            if self.path != "/api/launch" or not launcher:
+            publishing = self.path == "/api/publish"
+            deleting = self.path == "/api/delete-recording"
+            commenting = self.path == "/api/comment"
+            updating_recording = publishing or deleting or commenting
+            if not launcher or (not updating_recording and self.path not in ("/api/launch", "/api/stop", "/api/pause", "/api/resume", "/api/continue")):
                 self.send_error(404)
                 return
             if not self.valid_host() or self.headers.get("Origin") != "http://" + self.headers["Host"]:
                 self.send_error(403)
                 return
+            launching = self.path == "/api/launch"
+            fields = {"level", "mode"} if launching else {"id", "destination"} if publishing else {"id"}
+            if commenting:
+                fields.add("comment")
             try:
                 length = int(self.headers.get("Content-Length", "0"))
-                if self.headers.get_content_type() != "application/json" or not 0 < length <= 1024:
+                max_length = 12 * MAX_COMMENT_LENGTH + 256 if commenting else 1024
+                if self.headers.get_content_type() != "application/json" or not 0 < length <= max_length:
                     raise ValueError
                 data = decode(self.rfile.read(length))
-                if (not isinstance(data, dict) or data.keys() != {"level", "mode"}
-                        or not all(isinstance(value, str) for value in data.values())):
+                optional = {"rounds"} if launching or self.path in ("/api/resume", "/api/continue") else set()
+                if publishing:
+                    optional = {"enabled"}
+                if (not isinstance(data, dict) or not fields <= data.keys() <= (fields | optional)
+                        or not all(isinstance(data[key], str) for key in fields)):
+                    raise ValueError
+                if not launching and not RUN_ID.fullmatch(data["id"]):
+                    raise ValueError
+                if publishing and type(data.get("enabled")) is not bool:
                     raise ValueError
             except (ValueError, RecursionError):
-                self.send_json({"error": "Expected a puzzle and run mode."}, 400)
+                error = "Expected a puzzle and run mode." if launching else "Expected a run ID."
+                self.send_json({"error": error}, 400)
                 return
             try:
-                run_id = launcher.launch(data["level"], data["mode"])
+                if publishing:
+                    run_id = data["id"]
+                    with recording_updates:
+                        publish(root, public_root, run_id, data["destination"], data["enabled"])
+                elif deleting:
+                    run_id = data["id"]
+                    with recording_updates:
+                        delete_recording(root, public_root, run_id)
+                elif commenting:
+                    run_id = data["id"]
+                    with recording_updates:
+                        comment = save_comment(root, public_root, run_id, data["comment"])
+                elif launching:
+                    run_id = launcher.launch(data["level"], data["mode"], rounds=data.get("rounds"))
+                else:
+                    run_id = data["id"]
+                    if self.path == "/api/pause":
+                        launcher.pause_run(run_id)
+                    elif self.path == "/api/resume":
+                        launcher.resume_run(run_id, rounds=data.get("rounds"))
+                    elif self.path == "/api/continue":
+                        launcher.start_saved(run_id, rounds=data.get("rounds"))
+                    else:
+                        launcher.stop_run(run_id)
             except ValueError as error:
                 self.send_json({"error": str(error)}, 400)
-            except RunBusy as error:
+            except (RunBusy, BlockingIOError) as error:
                 self.send_json({"error": str(error)}, 409)
             except OSError:
-                self.send_json({"error": "Could not create the run recording."}, 500)
+                error = "Could not update the recording." if updating_recording else "Could not create the run recording."
+                self.send_json({"error": error}, 500)
             else:
-                self.send_json({"id": run_id}, 202)
+                response = {"id": run_id}
+                if commenting:
+                    response["comment"] = comment
+                if not launching and not updating_recording:
+                    response["run_state"] = launcher.run_state()
+                self.send_json(response, 202)
 
         def do_GET(self):
             if not self.valid_host():
@@ -93,15 +150,42 @@ def serve(root, port, launcher=None):
                 return
             parts = url.path.strip("/").split("/")
             if url.path == "/api/levels":
+                state = launcher.run_state() if launcher else {"active_run": None, "stopping": False}
+                model = launcher.model if launcher else None
                 self.send_json({
                     "levels": levels, "harness_version": HARNESS_VERSION,
                     "can_launch": launcher is not None,
-                    "model": launcher.model if launcher else None,
-                    "active_run": launcher.active_run if launcher else None,
+                    "can_demo": bool(launcher and launcher.allow_demo),
+                    "max_comment_length": MAX_COMMENT_LENGTH,
+                    "autoplay_latest": autoplay_latest,
+                    "default_level": settings.level,
+                    "can_pause": bool(launcher and launcher.interactive),
+                    "max_rounds": MAX_ROUNDS,
+                    "model": model,
+                    "round_defaults": {"demo": DEFAULT_DEMO_ROUNDS,
+                                       "model": launcher.settings.rounds if model else None},
+                    **state,
                 })
                 return
-            if url.path == "/api/runs":
-                self.send_json(summaries(root))
+            if url.path in ("/api/runs", "/api/recordings"):
+                lists = recording_lists(root, public_root)
+                self.send_json(lists if url.path == "/api/recordings" else lists["local"])
+                return
+            if url.path == "/api/preview":
+                name = parse_qs(url.query).get("level", [""])[0]
+                try:
+                    level = load_level(name)
+                    setup = settings.for_level(name)
+                except ValueError as error:
+                    self.send_json({"error": str(error)}, 400)
+                    return
+                agents = [str(number) for number in range(1, setup.agents + 1)]
+                puzzle = level.Puzzle(preview_seed, agents)
+                won, score = puzzle.evaluate()
+                self.send_json({"seed": preview_seed, "round": 0, "world": puzzle.snapshot(),
+                                "score": score, "won": won, "elapsed_seconds": 0,
+                                "agents": [Agent(id, []).snapshot() for id in agents],
+                                "event": {"kind": "preview"}})
                 return
             if len(parts) == 3 and parts[0] == "levels" and parts[2] == "viewer.js":
                 if parts[1].isascii() and parts[1].replace("_", "").isalnum():
@@ -109,13 +193,15 @@ def serve(root, port, launcher=None):
                     if path.is_file():
                         self.send(path.read_bytes(), "text/javascript; charset=utf-8")
                         return
-            if (len(parts) == 4 and parts[:2] == ["api", "runs"] and parts[-1] == "frames"
-                    and RUN_ID.fullmatch(parts[2]) and (root / parts[2]).is_dir()):
+            if (len(parts) == 4 and parts[0] == "api" and parts[1] in ("runs", "public") and parts[-1] == "frames"):
                 try:
+                    directory = recording_directory(public_root if parts[1] == "public" else root, parts[2])
+                    if (directory / "frames.jsonl").is_symlink():
+                        raise ValueError
                     offset = int(parse_qs(url.query).get("after", ["0"])[0])
                     if not 0 <= offset < 2**53:
                         raise ValueError
-                    batch, next_offset = frames(root / parts[2], offset)
+                    batch, next_offset = frames(directory, offset)
                 except (ValueError, OSError):
                     self.send_error(400, "Invalid frame offset")
                     return

@@ -3,20 +3,27 @@
 import argparse
 from pathlib import Path
 
-from dojo.config import Settings
+from dojo.config import BACKEND_KEYS, Settings
 from dojo.level import available_levels
 
 parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument("--output", type=Path, default=Path("bench.json"))
 parser.add_argument("--level", choices=available_levels(), default=Settings.level)
-parser.add_argument("--model", default=Settings.model, help="demo or an OpenRouter model ID")
+parser.add_argument("--backend", choices=BACKEND_KEYS, default=Settings.backend,
+                    help="model API to call (default: openrouter)")
+parser.add_argument("--model", default=Settings.model, help="demo or a model ID for the selected backend")
 parser.add_argument("--agents", type=int, help="agent count (1–8, defaults to the level's count)")
 parser.add_argument("--seed", type=int, help="use the same initial layout across runs")
-parser.add_argument("--rounds", type=int, help="max turns per agent (default: 60 for models, 160 for demos)")
+parser.add_argument("--rounds", type=int,
+                    help="max turns per agent (default: 160 for demos, 60 for most model runs)")
 parser.add_argument("--max-completion-tokens", type=int, default=Settings.max_completion_tokens)
 parser.add_argument("--request-timeout", type=int, default=Settings.request_timeout, metavar="SECONDS")
 parser.add_argument("--provider", help="pin a specific OpenRouter provider slug")
-parser.add_argument("--reasoning-effort", choices=("none", "minimal", "low", "medium", "high", "xhigh"))
+parser.add_argument("--gemini-input-tpm", type=int, help="Gemini input tokens per minute for your project and model")
+parser.add_argument("--gemini-rpm", type=int, help="Gemini requests per minute for your project and model")
+parser.add_argument("--gemini-thought-summaries", action="store_true", help="request Gemini thought summaries for the replay")
+parser.add_argument("--reasoning-effort", choices=("none", "minimal", "low", "medium", "high", "xhigh"),
+                    help="set reasoning effort for an OpenRouter model")
 parser.add_argument("--demo-delay", type=float, default=Settings.demo_delay, metavar="SECONDS")
 args = vars(parser.parse_args())
 output = args.pop("output")
