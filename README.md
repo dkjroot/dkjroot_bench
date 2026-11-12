@@ -36,13 +36,13 @@ You'll need Python 3.10 or newer and a browser. There are no extra Python
 packages to install. From the project directory, run:
 
 ```sh
-python3 bench.py --demo
+python3 bench.py --serve
 ```
 
-Open [http://127.0.0.1:8765](http://127.0.0.1:8765). The scripted agents can
-solve the puzzle without internet access or an API key. The script sends them
-out to look for clues, share what they see, and agree on a plan before anyone
-starts moving pieces. You can follow the whole thing for free.
+Open [http://127.0.0.1:8765](http://127.0.0.1:8765), pick a puzzle and click
+**Run demo**. You can switch puzzles and pick a saved recording from the same
+screen. The demos run without internet access or an API key. To start one
+straight from the terminal, use `python3 bench.py --demo --level word_jumble`.
 
 The viewer highlights the agent acting now and shows what they did. Use the
 arrow buttons to go one action at a time, or press **Play** and pick a speed.
@@ -56,6 +56,11 @@ find the sign and leave a position in which X has legally won. A move is
 one, two or three spaces along one axis, and each agent gets one tool call
 per turn. The cards beside the play area show each agent's latest view
 and the messages they've sent and received.
+
+Word Jumble gives a single agent a set of shuffled words. It can read the list
+and submit an answer. The initials of the words in the original sentence spell
+the answer, which scores 1 when submitted. The viewer shows each attempt and
+its feedback, then reveals the sentence when the agent gets it right.
 
 ## Try it with a model
 
@@ -74,23 +79,26 @@ optional provider and reasoning effort. You can start with fewer rounds to
 see how a model gets on. Four agents and 60 rounds allow up to 240 requests
 using your OpenRouter account.
 
-Each agent starts with “Solve the puzzle” and the tool definitions. The
+With a model configured and the key set, the viewer also has a **Run** button
+labelled with that model. It uses the saved settings for the selected puzzle.
+When you switch puzzles, the new puzzle's default agent count applies.
+
+Each agent starts with a short goal and the tool definitions. The
 spectator view and saved recording carry the level name. Each agent sees its
 own tool results and receives other agents' messages through its mailbox.
 The runner makes one request per active agent each round, waits for the
 replies, then applies actions in agent number order. A model reply has to
 contain a named tool call with JSON arguments matching the tool's fields,
-types and limits to change anything. The viewer runs on localhost and reads
-the recording. It has no game controls that can send actions back into the run.
+types and limits to change anything. The viewer runs on localhost. Once a
+run starts, the browser controls only the playback.
 
 The runner asks OpenRouter to disable web search and response healing. Use a
 key from an account without enforced plugin overrides, which can take
 precedence over those request settings. See the
 [OpenRouter plugin documentation](https://openrouter.ai/docs/guides/features/plugins/overview).
 
-Use `python3 bench.py --no-viewer` to run once and exit, or
-`python3 bench.py --serve` to open the viewer with the runs you've already
-recorded. Press Ctrl+C to stop the viewer.
+Use `python3 bench.py --no-viewer` to run once and exit. Press Ctrl+C to
+stop the viewer.
 
 ## Look back through the runs
 
@@ -104,8 +112,10 @@ Glass Tic-Tac-Toe scores from 0 to 1. Each wrong or missing square relative to
 the closest legal X win costs 0.2, down to zero. A square holding more than
 one piece needs fixing too. A score of 1 ends the run.
 
-In **Compare runs**, pick a level, seed and metric to graph the individual
-model runs. The table lets you see the setup and open any of those replays.
+In **Compare runs**, pick a level, run type, seed and metric to graph
+individual runs. Scripted demos show up for score, time and tool calls.
+Their token and cost fields are blank. The table shows the setup and lets
+you open any of those replays.
 For a fair comparison, use the same seeds, number of agents and run limits.
 The seed fixes the initial layout. Model replies and API timings can still vary.
 
@@ -116,8 +126,9 @@ title, version, goal, default agent count and a `Puzzle(seed, agents)` class.
 The class supplies the tool definitions, applies an action, scores the
 current state and produces a spectator snapshot. The common runner handles
 the agent contexts, mailboxes, calls to the model and recordings. The viewer
-can display snapshots as JSON, or a level can supply its own `viewer.js`
-for a graphical view. A level can also supply a scripted demo.
+can display snapshots as JSON, or a level can supply its own `viewer.js`.
+Glass Tic-Tac-Toe draws a board on a canvas, while Word Jumble renders
+words and submission history as text. A level can also supply a scripted demo.
 
 Run the offline checks with `python3 -m unittest discover -s tests -v`.
 

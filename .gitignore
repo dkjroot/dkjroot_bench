@@ -1,0 +1,15 @@
+AGENTS.md
+agents.md
+DEVELOPMENT.md
+development.md
+agent_docs/
+
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.env
+.DS_Store
+
+/bench.json
+/runs/
