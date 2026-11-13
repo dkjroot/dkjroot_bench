@@ -3,8 +3,8 @@ import math
 import secrets
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass, field
-from threading import Condition
-from time import monotonic
+from threading import Condition, Lock
+from time import monotonic, time
 
 from dojo.config import TEAM, validate_rounds
 from dojo.level import ImageObservation, Level, load_level, tool, validate_arguments
@@ -36,6 +36,11 @@ USAGE_FIELDS = {
 def usage_metrics():
     return {"requests": 0, **dict.fromkeys(USAGE_FIELDS, 0),
             "missing_usage": dict.fromkeys(USAGE_FIELDS, 0)}
+
+
+def validate_request_limit(value):
+    if value is not None and (type(value) is not int or not 1 <= value <= 10000):
+        raise ValueError("Requests per minute must be an integer from 1 to 10000.")
 
 
 class RunBusy(Exception):
@@ -74,6 +79,10 @@ class Run:
         self.backend = backend
         self.interactive = interactive
         self.control = Condition()
+        self.request_lock = Lock()
+        self.request_rpm = None
+        self.request_times = []
+        self.retry_at = 0
         self.round_limit = settings.rounds
         self.pause_requested = False
         self.pause_reason = None
@@ -126,6 +135,8 @@ class Run:
         self.record.checkpoint({
             "version": 1, "round": self.round, "elapsed_seconds": self.elapsed(),
             "profile_id": self.profile_id,
+            "request_times": self.request_times,
+            "retry_at": self.retry_at,
             **({"team_profiles": self.team_profiles, "team_models": self.team_models} if self.team else {}),
             "message_id": self.message_id, "metrics": self.metrics,
             "models": sorted(self.models), "providers": sorted(self.providers),
@@ -159,6 +170,9 @@ class Run:
         run.round = checkpoint["round"]
         run.message_id = checkpoint["message_id"]
         run.metrics = checkpoint["metrics"]
+        run.request_rpm = summary.get("request_rpm")
+        run.request_times = checkpoint.get("request_times", [])
+        run.retry_at = checkpoint.get("retry_at", 0)
         run.models, run.providers = set(checkpoint["models"]), set(checkpoint["providers"])
         run.team_models = checkpoint.get("team_models", {})
         run.agents = {data["id"]: Agent(**data) for data in checkpoint["agents"]}
@@ -272,6 +286,8 @@ class Run:
         return self.team["agents"][agent.id]["settings"]["backend"] if self.team else self.settings.backend
 
     def record_usage(self, agent, reply, *, track_model=True):
+        if reply.retry_after is not None:
+            self.retry_at = max(self.retry_at, time() + reply.retry_after)
         metrics = [self.metrics]
         if self.team:
             metrics.append(self.metrics["agent_usage"][agent.id])
@@ -394,6 +410,19 @@ class Run:
             agent.history.append({"role": "user", "content": images})
 
     def request_reply(self, agent):
+        while not self.stop.is_set():
+            with self.request_lock:
+                current = time()
+                self.request_times = [stamp for stamp in self.request_times if stamp > current - 60]
+                due = self.retry_at
+                if self.request_rpm and self.request_times:
+                    due = max(due, self.request_times[-1] + 60 / self.request_rpm)
+                    if len(self.request_times) >= self.request_rpm:
+                        due = max(due, self.request_times[-self.request_rpm] + 60)
+                if due <= current:
+                    self.request_times.append(current)
+                    break
+            self.stop.wait(due - current)
         if not self.stop.is_set():
             backend = self.backend[agent.id] if self.team else self.backend
             return backend.complete(agent.history, self.tools)
@@ -404,6 +433,7 @@ class Run:
                 "stopping": self.stop.is_set(), "round_limit": self.round_limit,
                 "pause_reason": self.pause_reason, "pausing": self.pause_requested and self.pause_reason is None,
                 "paused_round": self.paused_round if self.pause_reason else None,
+                "request_rpm": self.request_rpm, "model_run": self.backend is not None,
             }
 
     def pause(self):
@@ -412,7 +442,14 @@ class Run:
                 raise RunBusy("This run cannot be paused.")
             self.pause_requested = True
 
-    def resume(self, rounds=None):
+    def set_request_limit(self, rpm):
+        validate_request_limit(rpm)
+        if self.backend is None:
+            raise ValueError("Request pacing applies to model runs.")
+        self.request_rpm = rpm
+        self.record.summary["request_rpm"] = rpm
+
+    def resume(self, rounds=None, pacing=None):
         with self.control:
             if not self.pause_reason or self.finished or self.stop.is_set():
                 raise RunBusy("Wait for the run to pause before resuming.")
@@ -420,6 +457,8 @@ class Run:
             validate_rounds(limit)
             if limit <= self.paused_round:
                 raise ValueError(f"Max rounds must be greater than the {self.paused_round} completed rounds.")
+            if pacing is not None:
+                self.set_request_limit(pacing["rpm"])
             self.round_limit = limit
             self.pause_reason = None
             self.pause_requested = False

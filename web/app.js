@@ -28,6 +28,7 @@ const labels = {
 let runs = [], selected = "", frames = [], offset = 0, cursor = 0;
 let catalog = {levels: []}, selectedPuzzle = "", requestedRun = null, launching = false, stoppingRun = null;
 let changingPause = false, roundInputRun = null, nextRounds = "";
+let pacingRun = null, deletingUnpublished = false;
 let follow = true, streaming = false, replay = false, playbackFrame = null;
 let playback = null, activeBubble = null, bubbleTimer = null;
 let spritePulse = 0;
@@ -158,6 +159,8 @@ function renderLaunchControls() {
   const team = savedTeams.find(team => "team:" + team.id === picker.value);
   squad.show(team, level, busy);
   const canModel = catalog.can_launch && level && picker.value && (!team || squad.valid());
+  $("launch-rpm-control").hidden = Boolean(active) || !picker.value || !level;
+  $("launch-rpm").disabled = busy;
   $("model-profile-control").hidden = !(catalog.can_manage_profiles || catalog.model);
   picker.disabled = busy || !launchChoices.length;
   const recording = localRecording();
@@ -165,6 +168,14 @@ function renderLaunchControls() {
     && recording.harness_version === catalog.harness_version && recording.level_version === level?.version
     && (recording.settings.model !== "demo" || catalog.can_demo) ? recording : null;
   const defaults = catalog.round_defaults;
+  const pacingId = paused && catalog.model_run ? active : saved && saved.settings.model !== "demo" ? saved.id : null;
+  const rpm = $("request-rpm");
+  if (pacingRun !== pacingId) {
+    pacingRun = pacingId;
+    rpm.value = (active ? catalog.request_rpm : saved?.request_rpm) ?? "";
+  }
+  $("request-pacing").hidden = !pacingId;
+  rpm.disabled = changingPause || launching || exhausted;
   const modelRounds = team || profile ? (team ?? profile).rounds ?? level?.model_rounds : defaults?.model;
   const input = $("round-limit");
   if (roundInputRun !== active) {
@@ -229,6 +240,8 @@ async function launch(mode) {
   const level = selectedPuzzle;
   const continuing = mode === "continue";
   const request = continuing ? {id: localRecording().id} : {level, mode};
+  if (continuing && !addPacing(request)) return;
+  if (mode === "model" && !addPacing(request, $("launch-rpm"))) return;
   const profile = $("model-profile").value;
   if (mode === "model" && profile.startsWith("team:")) {
     if (!squad.valid()) return;
@@ -265,12 +278,20 @@ async function launch(mode) {
   }
 }
 
+function addPacing(request, input = $("request-rpm")) {
+  if (input === $("request-rpm") && $("request-pacing").hidden) return true;
+  if (!input.reportValidity()) return false;
+  request.pacing = {rpm: input.value === "" ? null : input.valueAsNumber};
+  return true;
+}
+
 async function toggleRunPause() {
   const id = catalog.active_run;
   const resuming = Boolean(catalog.pause_reason);
   const input = $("round-limit");
   if (resuming && !input.reportValidity()) return;
   const body = {id};
+  if (resuming && !addPacing(body)) return;
   if (resuming && input.value !== "") body.rounds = input.valueAsNumber;
   changingPause = true;
   $("launch-status").hidden = true;
@@ -841,16 +862,20 @@ function markRead(receipt, agent, read, delivery = false) {
   receipt.setAttribute("aria-label", label);
 }
 
-function messageRow(id, sender, recipients, text, autoMail) {
+function dialogueRow(sender, label, text) {
   const row = el("li", "message");
-  row.dataset.messageId = id;
   row.style.setProperty("--sender", colors[Number(sender) - 1]);
+  const content = el("p", "message-content");
+  content.append(el("strong", "message-route", label + ": "), document.createTextNode(text));
+  row.append(content);
+  return row;
+}
+
+function messageRow(id, sender, recipients, text, autoMail) {
   const to = recipients.length > 1 && !identity(sender) ? "Agents " + recipients.join(", ")
     : recipients.length ? recipients.map(agentName).join(", ") : "no other agents";
-  const content = el("p", "message-content");
-  content.append(el("strong", "message-route", agentName(sender) + " to " + to + ": "),
-    document.createTextNode(text));
-  row.append(content);
+  const row = dialogueRow(sender, agentName(sender) + " to " + to, text);
+  row.dataset.messageId = id;
 
   const receipts = new Map();
   if (recipients.length) {
@@ -886,16 +911,18 @@ function renderCommunications(agents) {
         }
       }
     }
-    if (kind !== "tool") continue;
-    if (name === "readMyMessages") {
+    if (kind === "tool" && name === "readMyMessages") {
       for (const message of result?.messages ?? []) {
         const receipt = messageRows.get(message.id)?.receipts.get(agent);
         if (receipt) markRead(receipt, agent, !rewind);
       }
-    } else if ((name === "messageOtherAgent" || name === "messageAllOtherAgents")
-               && Array.isArray(result?.delivered_to)) {
+    }
+    const thinking = kind === "thinking" && typeof frame.event.text === "string" && frame.event.text.trim();
+    const sent = kind === "tool" && (name === "messageOtherAgent" || name === "messageAllOtherAgents")
+      && Array.isArray(result?.delivered_to);
+    if (thinking || sent) {
       // The send frame includes the message ID even when later snapshots roll it out of view.
-      const sender = frame.agents.find(candidate => candidate.id === agent);
+      const sender = sent && frame.agents.find(candidate => candidate.id === agent);
       const id = sender?.sent?.at(-1)?.id ?? "frame-" + frame.index;
       if (top === undefined) {
         top = list.scrollTop;
@@ -905,15 +932,25 @@ function renderCommunications(agents) {
         messageRows.get(id)?.row.remove();
         messageRows.delete(id);
       } else {
-        const view = messageRow(id, agent, result.delivered_to, args?.message ?? "", autoMail);
+        const view = thinking
+          ? {row: dialogueRow(agent, agentName(agent) + " thinking", frame.event.text), receipts: new Map()}
+          : messageRow(id, agent, result.delivered_to, args?.message ?? "", autoMail);
+        if (thinking) view.row.classList.add("message-thinking");
         messageRows.set(id, view);
         list.prepend(view.row);
       }
     }
   }
   messageCursor = cursor;
-  list.hidden = !messageRows.size;
-  $("communications-empty").hidden = Boolean(messageRows.size);
+  const showThinking = $("show-thinking").checked;
+  let visible = false;
+  for (const {row} of messageRows.values()) {
+    row.hidden = !showThinking && row.classList.contains("message-thinking");
+    visible ||= !row.hidden;
+  }
+  list.hidden = !visible;
+  $("communications-empty").hidden = visible;
+  $("communications-empty").textContent = showThinking ? "No messages or thinking yet." : "No messages yet.";
   $("communications").hidden = agents.length < 2 && !messageRows.size;
   if (top !== undefined) list.scrollTop = top <= 6 ? 0 : top + list.scrollHeight - height;
 }
@@ -1437,7 +1474,40 @@ async function deleteRecording(run) {
   }
 }
 
+function unpublishedRecordings() {
+  return runs.filter(run => !run.public_id && !run.published_locally && !run.published_to_git
+    && !["running", "paused"].includes(run.status) && !recordingUpdates.has(run.id));
+}
+
+async function removeUnpublished() {
+  const ids = unpublishedRecordings().map(run => run.id);
+  if (!ids.length || deletingUnpublished || !confirm(
+    "Permanently delete " + ids.length + " unpublished recording" + (ids.length === 1 ? "" : "s") + "?"
+  )) return;
+  deletingUnpublished = true;
+  renderRecordings();
+  const status = $("publication-status");
+  status.hidden = false;
+  status.textContent = "Deleting unpublished recordings…";
+  try {
+    const result = await postRun("delete-unpublished", {ids}, "Could not delete unpublished recordings.");
+    const removed = new Set(result.deleted);
+    runs = runs.filter(run => !removed.has(run.id));
+    updateRecordings();
+    status.textContent = "Deleted " + removed.size + " unpublished recording" + (removed.size === 1 ? "" : "s") + "."
+      + (result.skipped.length ? " Skipped " + result.skipped.length + " unavailable or protected." : "");
+  } catch (error) {
+    status.textContent = error.message;
+  } finally {
+    deletingUnpublished = false;
+    if (managing) renderRecordings();
+  }
+}
+
 function renderRecordings() {
+  const bulk = $("delete-unpublished");
+  bulk.hidden = !catalog.can_launch;
+  bulk.disabled = deletingUnpublished || !unpublishedRecordings().length;
   const container = $("recording-management");
   const local = new Set(runs.filter(run => !run.public_id).map(run => run.id));
   const recordings = runs.filter(run => !local.has(run.public_id));
@@ -1458,7 +1528,8 @@ function renderRecordings() {
     row.insertCell().textContent = labels[run.status] ?? run.status;
     commentCell(row.insertCell(), run);
     const localCell = row.insertCell(), gitCell = row.insertCell();
-    const disabled = !catalog.can_launch || recordingUpdates.has(run.id) || ["running", "paused"].includes(run.status);
+    const disabled = !catalog.can_launch || deletingUnpublished || recordingUpdates.has(run.id)
+      || ["running", "paused"].includes(run.status);
     const demo = run.settings.model === "demo";
     if (!run.public_id && (!demo || run.published_locally)) {
       const toggle = el("button", "button", run.published_locally ? "Unpublish locally" : "Publish locally");
@@ -1499,8 +1570,23 @@ const recordedRuns = () => {
 };
 
 function runMetric(run, field) {
-  if (field === "cost_usd") return run.cost_usd ?? runCost(run, run.metrics);
-  return run[field] ?? usage(run.metrics, field);
+  const value = field === "cost_usd" ? run.cost_usd ?? runCost(run, run.metrics)
+    : run[field] ?? usage(run.metrics, field);
+  if (value != null || !partialUsage(run, field)) return value;
+  return run.metrics[field];
+}
+
+function partialUsage(run, field) {
+  const metrics = run.metrics;
+  const missing = metrics?.missing_usage?.[field];
+  return missing > 0 && missing < metrics.requests && Number.isFinite(metrics[field])
+    && (field !== "cost_usd" || (!hasEstimatedCost(run) && runCost(run, metrics) == null));
+}
+
+function comparisonValue(run, field) {
+  const value = runMetric(run, field);
+  const formatted = field === "cost_usd" ? costText(run, value) : format(field, value);
+  return partialUsage(run, field) ? formatted + " (partial)" : formatted;
 }
 
 function refreshFilters() {
@@ -1518,34 +1604,102 @@ function refreshFilters() {
   renderComparison();
 }
 
+function renderScatter(samples, x, y, xLabel, yLabel) {
+  const plot = el("div", "scatter");
+  const grid = el("div", "scatter-grid");
+  const axis = el("div", "scatter-x", xLabel);
+  plot.append(el("span", "scatter-y", yLabel), grid, axis);
+  const xMax = x === "score" ? 1 : Math.max(0, ...samples.map(point => point[1])) || 1;
+  const yMax = y === "score" ? 1 : Math.max(0, ...samples.map(point => point[2])) || 1;
+  for (let i = 0; i <= 4; i++) {
+    const line = el("div", "scatter-grid-line");
+    line.style.top = 100 - i * 25 + "%";
+    line.append(el("span", "scatter-tick", format(y, yMax * i / 4)));
+    grid.append(line);
+    const tick = el("span", "scatter-tick", format(x, xMax * i / 4));
+    tick.style.left = i * 25 + "%";
+    axis.append(tick);
+  }
+  const groups = new Map();
+  for (const [run, xValue, yValue] of samples) {
+    const key = xValue + "/" + yValue;
+    if (!groups.has(key)) groups.set(key, {xValue, yValue, runs: []});
+    groups.get(key).runs.push(run);
+  }
+  for (const {xValue, yValue, runs: matches} of groups.values()) {
+    const point = el("button", "scatter-point", matches.length > 1 ? matches.length : "");
+    point.type = "button";
+    point.style.left = xValue / xMax * 100 + "%";
+    point.style.top = (1 - yValue / yMax) * 100 + "%";
+    const partial = matches.some(run => partialUsage(run, x) || partialUsage(run, y));
+    point.dataset.partial = partial;
+    const coordinates = xLabel + " " + format(x, xValue) + ", " + yLabel + " " + format(y, yValue);
+    point.title = coordinates + (partial ? " · Includes partial usage" : "") + " · " + matches.map(runLabel).join("\n");
+    point.setAttribute("aria-label", matches.length === 1 ? point.title : matches.length + " runs · " + coordinates);
+    point.addEventListener("click", () => {
+      if (matches.length === 1) {
+        watchRun(matches[0]);
+        return;
+      }
+      const details = $("point-runs");
+      details.replaceChildren(el("span", "quiet", coordinates), ...matches.map(run => {
+        const button = el("button", "button", runLabel(run));
+        button.type = "button";
+        button.addEventListener("click", () => watchRun(run));
+        return button;
+      }));
+      details.hidden = false;
+      details.querySelector("button").focus();
+    });
+    grid.append(point);
+  }
+  $("chart").replaceChildren(plot);
+}
+
 function renderComparison() {
   const seed = $("seed-filter").value;
   const data = recordedRuns().filter(run => levelKey(run) === $("level-filter").value
     && (!seed || String(run.settings.seed) === seed));
   const metric = $("metric-filter").value;
-  const samples = data.map(run => [run, runMetric(run, metric)])
-    .filter(([, value]) => value != null)
+  const scatter = $("chart-type").value === "scatter";
+  const x = $("x-metric").value;
+  $("x-metric-control").hidden = !scatter;
+  $("y-metric-label").textContent = scatter ? "Y axis" : "Metric";
+  $("point-runs").hidden = true;
+  const fields = scatter ? [x, metric] : [metric];
+  const samples = data.map(run => [run, ...fields.map(field => runMetric(run, field))])
+    .filter(([, ...values]) => values.every(Number.isFinite))
     .sort(([a], [b]) => runName(a).localeCompare(runName(b)) || a.id.localeCompare(b.id));
   $("chart-note").textContent = !data.length
     ? "No published runs match these filters."
-    : !samples.length ? "No results are available for this metric."
-    : metric === "cost_usd" && samples.some(([run]) => hasEstimatedCost(run)) ? estimatedCostNote
-    : "Each bar is one run. The table includes the seed, outcome and run settings.";
-  const max = metric === "score" ? 1 : Math.max(0, ...samples.map(([, value]) => value));
-  const models = [...new Set(samples.map(([run]) => run.team?.name ?? run.settings.model))];
-  $("chart").replaceChildren(...samples.map(([run, value]) => {
-    const row = el("div", "bar-row");
-    const track = el("div", "bar-track");
-    const bar = el("div", "bar");
-    bar.style.width = (max ? 100 * value / max : 0) + "%";
-    bar.style.setProperty("--agent", colors[models.indexOf(run.team?.name ?? run.settings.model) % colors.length]);
-    track.append(bar);
-    row.title = [runLabel(run), run.comment].filter(Boolean).join("\n");
-    const label = el("span", "", (run.team?.name ?? run.settings.model) + " · " + run.settings.seed);
-    if (run.comment) label.append(el("small", "graph-comment", run.comment));
-    row.append(label, track, el("span", "bar-value", metric === "cost_usd" ? costText(run, value) : format(metric, value)));
-    return row;
-  }));
+    : !samples.length ? "No runs have values for the selected metrics."
+    : (scatter ? "Select a point to watch the run. Numbered points contain overlapping runs. " : "Each bar is one run. ")
+      + (samples.length < data.length ? (data.length - samples.length) + " runs are missing a selected metric. " : "")
+      + (samples.some(([run]) => fields.some(field => partialUsage(run, field)))
+        ? "Red values show reported usage from runs with incomplete usage data. " : "")
+      + (fields.includes("cost_usd") && samples.some(([run]) => hasEstimatedCost(run)) ? estimatedCostNote : "");
+  if (scatter && samples.length) {
+    renderScatter(samples, x, metric, $("x-metric").selectedOptions[0].textContent,
+      $("metric-filter").selectedOptions[0].textContent);
+  } else {
+    const max = metric === "score" ? 1 : Math.max(0, ...samples.map(([, value]) => value));
+    const models = [...new Set(samples.map(([run]) => run.team?.name ?? run.settings.model))];
+    $("chart").replaceChildren(...samples.map(([run, value]) => {
+      const row = el("div", "bar-row");
+      const track = el("div", "bar-track");
+      const bar = el("div", "bar");
+      bar.style.width = (max ? 100 * value / max : 0) + "%";
+      bar.style.setProperty("--agent", colors[models.indexOf(run.team?.name ?? run.settings.model) % colors.length]);
+      track.append(bar);
+      row.title = [runLabel(run), run.comment].filter(Boolean).join("\n");
+      const label = el("span", "", (run.team?.name ?? run.settings.model) + " · " + run.settings.seed);
+      if (run.comment) label.append(el("small", "graph-comment", run.comment));
+      const amount = el("span", "bar-value", comparisonValue(run, metric));
+      amount.dataset.partial = partialUsage(run, metric);
+      row.append(label, track, amount);
+      return row;
+    }));
+  }
 
   const table = el("table");
   const head = table.createTHead().insertRow();
@@ -1571,13 +1725,19 @@ function renderComparison() {
       format("score", run.score),
       format("halts", runMetric(run, "halts")),
       format("elapsed_seconds", run.elapsed_seconds),
-      format("total_tokens", runMetric(run, "total_tokens")),
-      costText(run, runMetric(run, "cost_usd")),
+      comparisonValue(run, "total_tokens"),
+      comparisonValue(run, "cost_usd"),
       settings.agents + (settings.agents === 1 ? " agent" : " agents") + " · " + settings.rounds + " rounds"
         + (teamModels ? "" : " · " + settings.max_completion_tokens + " max reply tokens · "
           + (settings.reasoning_effort ?? "default reasoning")),
     ];
     values.forEach(value => row.append(el("td", "", value)));
+    for (const [index, field] of [[9, "total_tokens"], [10, "cost_usd"]]) {
+      if (partialUsage(run, field)) {
+        row.cells[index].dataset.partial = true;
+        row.cells[index].title = "Usage missing for " + run.metrics.missing_usage[field] + " requests.";
+      }
+    }
     commentCell(row.insertCell(), run);
   }
   $("history").replaceChildren(...(data.length ? [table] : []));
@@ -1586,6 +1746,10 @@ function renderComparison() {
 $("spectate-tab").addEventListener("click", () => showPage("spectate"));
 $("compare-tab").addEventListener("click", () => showPage("compare"));
 $("recordings-tab").addEventListener("click", () => showPage("recordings"));
+$("show-thinking").addEventListener("change", () => {
+  if (frames[cursor]) renderCommunications(frames[cursor].agents);
+});
+$("delete-unpublished").addEventListener("click", removeUnpublished);
 $("profiles-tab").addEventListener("click", () => showPage("profiles"));
 $("profiles-configured").addEventListener("change", renderProfiles);
 $("refresh-model-catalog").addEventListener("click", () => loadModelCatalog(true));
@@ -1635,6 +1799,10 @@ $("profile-form").addEventListener("submit", event => {
 $("graph-source").addEventListener("change", refreshFilters);
 $("level-filter").addEventListener("change", refreshFilters);
 $("metric-filter").addEventListener("change", renderComparison);
+$("x-metric").replaceChildren(...[...$("metric-filter").options].map(option => option.cloneNode(true)));
+$("x-metric").value = "total_tokens";
+$("x-metric").addEventListener("change", renderComparison);
+$("chart-type").addEventListener("change", renderComparison);
 $("seed-filter").addEventListener("change", renderComparison);
 const squad = squadPicker(renderLaunchControls);
 const teams = teamEditor({

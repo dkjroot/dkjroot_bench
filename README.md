@@ -214,6 +214,10 @@ viewer pauses. **Resume run** retries the failed calls in that round and
 uses the successful replies it already has. A paused or stopped run has
 a checkpoint. After restarting the viewer, select its recording and click
 **Resume saved run** to continue with the same model and agent histories.
+Set **Run RPM** before starting a model or squad run to pace requests across
+all the agents from the first round. You can adjust **Run requests per minute**
+before resuming. The limit is saved with the run. Leave the field blank to
+remove the run-wide cap.
 If it stopped at the round limit, enter a higher **Max rounds** first.
 Keep `checkpoint.json` private if you share a replay. It contains the agents'
 full histories and the replies needed to resume the game.
@@ -242,7 +246,9 @@ the closest legal X win costs 0.2, down to zero. A square holding more than
 one piece needs fixing too. A score of 1 ends the run.
 
 In **Compare runs**, choose **Published locally**, **Local and public**, or
-**Public**, then pick a level, seed and metric. The level and version list
+**Public**, then pick a level and seed. In the scatter plot, put cost or
+tokens on the X axis and score on the Y axis. Click a point to watch its
+replay. Use **Bars** to see one metric at a time. The level and version list
 comes from the published model recordings in that view. A run published
 both ways appears once in the combined view. You can watch saved demos from
 **Recordings**. The graphs are for model runs. The **Halts** metric counts
@@ -259,6 +265,8 @@ to your own graphs. You can remove it from those graphs at any time.
 when you published it, even if you later resume the local run.
 Use **Delete** to remove a finished local recording that hasn't been
 published to Git. The viewer asks for confirmation first.
+**Delete all unpublished** clears finished runs that haven't been published
+locally or to Git.
 
 Use **Add comment** or **Edit comment** to leave a note on a recording.
 Comments appear in **Recordings** and **Compare runs**. A Git-published run

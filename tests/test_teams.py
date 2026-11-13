@@ -157,11 +157,12 @@ class TeamTests(unittest.TestCase):
             router.return_value.complete.return_value = self.reply("google/gemini-3.5-flash-lite", usage={})
             direct.return_value.complete.return_value = self.reply("gemini-3.5-flash-lite-001", usage={})
             run_id = launcher.launch("glass_tic_tac_toe", "team", team_id=team["id"],
-                                     squad=[1, 7], team_revision=team["revision"])
+                                     squad=[1, 7], team_revision=team["revision"], pacing={"rpm": 600})
             launcher.wait(5)
             router.return_value.complete.assert_called_once()
             direct.return_value.complete.assert_called_once()
         summary = json.loads((launcher.root / run_id / "summary.json").read_text())
         self.assertEqual(summary["settings"]["agents"], 2)
+        self.assertEqual(summary["request_rpm"], 600)
         self.assertEqual([agent["name"] for agent in summary["team"]["agents"].values()], ["Rhea", "Moon 8"])
         self.assertEqual(self.teams.get(team["id"])["agents"], roster)

@@ -7,11 +7,31 @@ from unittest.mock import Mock
 
 from dojo.config import Settings
 from dojo.models import Reply
-from dojo.publication import delete_recording, publish, recording_lists, save_comment
+from dojo.publication import delete_recording, delete_unpublished, publish, recording_lists, save_comment
 from dojo.runner import Run
 
 
 class PublicationTests(unittest.TestCase):
+    def test_bulk_delete_protects_publications_and_active_recordings(self):
+        with TemporaryDirectory() as directory:
+            local = Path(directory) / "runs"
+            public = Path(directory) / "recordings"
+            backend = Mock()
+            backend.complete.return_value = Reply({"tool_calls": []}, {})
+            settings = Settings(level="word_jumble", model="example/model", rounds=1)
+            runs = [Run(settings, local, Event(), backend) for _ in range(4)]
+            self.addCleanup(runs[-1].record.close)
+            for run in runs[:3]:
+                run.execute()
+            unpublished, locally_published, git_published, active = [run.record.id for run in runs]
+            publish(local, public, locally_published, "local", True)
+            publish(local, public, git_published, "git", True)
+            result = delete_unpublished(local, public, [unpublished, locally_published, git_published, active])
+            self.assertEqual(result, {"deleted": [unpublished], "skipped": [locally_published, git_published, active]})
+            self.assertFalse((local / unpublished).exists())
+            self.assertTrue(all((local / id).exists() for id in result["skipped"]))
+            self.assertTrue((public / git_published).exists())
+
     def test_comments_follow_a_run_into_git_and_remain_editable_after_publication(self):
         with TemporaryDirectory() as directory:
             local = Path(directory) / "runs"

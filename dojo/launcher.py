@@ -6,7 +6,7 @@ from dojo.config import BACKEND_KEYS, TEAM, Settings
 from dojo.gemini import Gemini
 from dojo.level import load_level
 from dojo.models import DirectChat, OpenRouter
-from dojo.runner import Run, RunBusy
+from dojo.runner import Run, RunBusy, validate_request_limit
 from dojo.storage import RUN_ID, Record
 
 
@@ -54,9 +54,9 @@ class Launcher:
         with self.lock:
             self._active_run(run_id).pause()
 
-    def resume_run(self, run_id, rounds=None):
+    def resume_run(self, run_id, rounds=None, pacing=None):
         with self.lock:
-            self._active_run(run_id).resume(rounds)
+            self._active_run(run_id).resume(rounds, pacing)
 
     def shutdown(self):
         with self.lock:
@@ -64,7 +64,12 @@ class Launcher:
             if self.run:
                 self.run.interrupt()
 
-    def launch(self, level, mode, rounds=None, profile_id=None, team_id=None, squad=None, team_revision=None):
+    def launch(self, level, mode, rounds=None, profile_id=None, team_id=None, squad=None, team_revision=None,
+               pacing=None):
+        if pacing is not None:
+            validate_request_limit(pacing["rpm"])
+            if mode == "demo":
+                raise ValueError("Request pacing applies to model runs.")
         if team_id is None and (squad is not None or team_revision is not None):
             raise ValueError("Choose a team before picking a squad.")
         if team_id is not None:
@@ -84,8 +89,9 @@ class Launcher:
                 }}
                 stop = Event()
                 backends = self._team_backends(settings, roster, profile_ids, profiles, stop)
-                return self._start(Run(settings, self.root, stop, backends, interactive=self.interactive,
-                                       team=roster, team_profiles=profile_ids))
+                run = Run(settings, self.root, stop, backends, interactive=self.interactive,
+                          team=roster, team_profiles=profile_ids)
+                return self._start(run, pacing)
         if profile_id is not None:
             if mode != "model" or self.profiles is None:
                 raise ValueError("Choose an available model profile.")
@@ -93,24 +99,25 @@ class Launcher:
             if rounds is not None:
                 options["rounds"] = rounds
             settings = self.settings.for_level(level, **options)
-            return self.start(settings, profile_id=profile_id, profile_name=name, key=key)
+            return self.start(settings, profile_id=profile_id, profile_name=name, key=key, pacing=pacing)
         if mode == "demo":
             settings = self.settings.for_level(level, model="demo", rounds=rounds)
         elif mode == "model" and self.model:
             settings = self.settings.for_level(level, rounds=self.settings.rounds if rounds is None else rounds)
         else:
             raise ValueError("Choose an available run mode.")
-        return self.start(settings)
+        return self.start(settings, pacing=pacing)
 
-    def start(self, settings, *, profile_id=None, profile_name=None, key=None):
+    def start(self, settings, *, profile_id=None, profile_name=None, key=None, pacing=None):
         with self.lock:
             self._check_idle()
             stop = Event()
             backend = self._backend(settings, stop, key)
-            return self._start(Run(settings, self.root, stop, backend, interactive=self.interactive,
-                                   profile_id=profile_id, profile_name=profile_name))
+            run = Run(settings, self.root, stop, backend, interactive=self.interactive,
+                      profile_id=profile_id, profile_name=profile_name)
+            return self._start(run, pacing)
 
-    def start_saved(self, run_id, rounds=None):
+    def start_saved(self, run_id, rounds=None, pacing=None):
         with self.lock:
             self._check_idle()
             if not self.interactive or not RUN_ID.fullmatch(run_id):
@@ -131,6 +138,10 @@ class Launcher:
                 if rounds is not None:
                     options["rounds"] = rounds
                 settings = Settings(**options)
+                if pacing is not None:
+                    validate_request_limit(pacing["rpm"])
+                    if settings.model == "demo":
+                        raise ValueError("Request pacing applies to model runs.")
                 completed = checkpoint["round"] - int(checkpoint["round_open"])
                 if settings.rounds <= completed:
                     raise ValueError(f"Max rounds must be greater than the {completed} completed rounds.")
@@ -151,6 +162,8 @@ class Launcher:
                 else:
                     backend = self._backend(settings, stop)
                 run = Run.restore(settings, directory, summary, checkpoint, stop, backend, lock)
+                if pacing is not None:
+                    run.set_request_limit(pacing["rpm"])
             except (FileNotFoundError, KeyError, TypeError, AttributeError) as error:
                 lock.close()
                 raise ValueError("This recording has no usable checkpoint.") from error
@@ -191,7 +204,10 @@ class Launcher:
                 backends[profile_id] = self._backend(member, stop, key)
         return {agent_id: backends[profile_id] for agent_id, profile_id in ids.items()}
 
-    def _start(self, run):
+    def _start(self, run, pacing=None):
+        if pacing is not None:
+            run.set_request_limit(pacing["rpm"])
+            run.record.save_summary()
         self.run = run
         self.worker = Thread(target=self.execute, args=(run,))
         self.worker.start()

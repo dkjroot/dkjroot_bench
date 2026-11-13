@@ -8,6 +8,11 @@ from urllib.request import HTTPRedirectHandler, Request, build_opener
 from dojo.wire import MAX_REPLY_BYTES, decode
 
 
+def openrouter_account_rate_rejection(error):
+    return (isinstance(error, str) and error.startswith("OpenRouter HTTP 429:")
+            and "new-account-rpm/" in error)
+
+
 class NoRedirect(HTTPRedirectHandler):
     def redirect_request(self, request, response, code, message, headers, url):
         return None
@@ -41,6 +46,7 @@ class Reply:
     native_content: dict | None = None
     rate_limit_retries: int = 0
     thought_summary: str | None = None
+    retry_after: float | None = None
 
 
 class ChatCompletions:
@@ -89,7 +95,14 @@ class ChatCompletions:
                 failure = response.get("error")
                 detail = failure.get("message") if isinstance(failure, dict) else None
                 reason = detail if isinstance(detail, str) and detail.strip() else error.reason
-                return self.reply(response, started, error=f"{self.provider_name} HTTP {error.code}: {reason}")
+                retry_after = None
+                if error.code == 429:
+                    hint = error.headers.get("Retry-After", "") if error.headers else ""
+                    retry_after = min(int(hint), 86400) if hint.isascii() and hint.isdecimal() and len(hint) <= 9 else 60
+                message = f"{self.provider_name} HTTP {error.code}: {reason}"
+                if openrouter_account_rate_rejection(message) and not response.get("usage") and not response.get("id"):
+                    response["usage"] = dict.fromkeys(("prompt_tokens", "completion_tokens", "total_tokens", "cost"), 0)
+                return self.reply(response, started, error=message, retry_after=retry_after)
         except (OSError, HTTPException, ValueError, TypeError, KeyError, IndexError, RecursionError) as error:
             return self.reply(response, started, error=f"{self.provider_name} request failed: {error}")
 

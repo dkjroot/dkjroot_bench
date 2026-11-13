@@ -14,6 +14,43 @@ from dojo.storage import frames, summaries
 
 
 class RunControlTests(unittest.TestCase):
+    def test_request_cap_can_be_set_on_error_and_survives_saved_resume(self):
+        with TemporaryDirectory() as directory, patch("dojo.launcher.OpenRouter") as factory:
+            root = Path(directory)
+            settings = Settings(level="word_jumble", model="example/model", rounds=1)
+            backend = factory.return_value
+            backend.complete.side_effect = [
+                Reply(None, {}, error="429 Rate limited"),
+                Reply({"tool_calls": [{"id": "call", "type": "function",
+                                      "function": {"name": "read", "arguments": "{}"}}]}, {}),
+            ]
+            launcher = Launcher(settings, root, "test-key", interactive=True)
+            run_id = launcher.launch(settings.level, "model")
+            try:
+                self.wait_for_pause(launcher, "error", 0)
+                with self.assertRaisesRegex(ValueError, "Requests per minute"):
+                    launcher.resume_run(run_id, pacing={"rpm": 0})
+                start = monotonic()
+                launcher.resume_run(run_id, pacing={"rpm": 120})
+                self.wait_for_pause(launcher, "round_limit", 1)
+                self.assertGreaterEqual(monotonic() - start, 0.4)
+                self.assertEqual(launcher.run_state()["request_rpm"], 120)
+            finally:
+                launcher.shutdown()
+                launcher.wait(5)
+            self.assertEqual(summaries(root)[0]["request_rpm"], 120)
+            backend.complete.side_effect = None
+            backend.complete.return_value = Reply({"tool_calls": [{"id": "next", "type": "function",
+                "function": {"name": "read", "arguments": "{}"}}]}, {})
+            restored = Launcher(settings, root, "test-key", interactive=True)
+            try:
+                restored.start_saved(run_id, rounds=2, pacing={"rpm": 180})
+                self.wait_for_pause(restored, "round_limit", 2)
+                self.assertEqual(restored.run_state()["request_rpm"], 180)
+            finally:
+                restored.shutdown()
+                restored.wait(5)
+
     def wait_for_pause(self, launcher, reason, completed):
         deadline = monotonic() + 5
         delay = Event()

@@ -1,13 +1,48 @@
 import filecmp
 import json
 import shutil
+from functools import lru_cache
 from pathlib import Path
 from tempfile import NamedTemporaryFile
 from uuid import uuid4
 
+from dojo.models import openrouter_account_rate_rejection
 from dojo.storage import RUN_ID, Record, summaries
 
 MAX_COMMENT_LENGTH = 1000
+
+
+@lru_cache(maxsize=256)
+def uncounted_rate_rejections(path, modified, size):
+    count = 0
+    try:
+        with path.open(encoding="utf-8") as source:
+            for line in source:
+                event = json.loads(line)["event"]
+                if (event.get("kind") == "request" and not event.get("generation_id")
+                        and not event.get("usage") and openrouter_account_rate_rejection(event.get("error"))):
+                    count += 1
+    except (OSError, ValueError, KeyError, TypeError):
+        return 0
+    return count
+
+
+def reconcile_rate_rejections(run, directory):
+    metrics = run.get("metrics", {})
+    missing = metrics.get("missing_usage", {})
+    if (run["settings"].get("backend") != "openrouter" or not any(missing.values())
+            or run.get("status") in ("running", "paused")):
+        return
+    path = directory / "frames.jsonl"
+    if path.is_symlink():
+        return
+    try:
+        stat = path.stat()
+    except OSError:
+        return
+    count = uncounted_rate_rejections(path, stat.st_mtime_ns, stat.st_size)
+    if count:
+        metrics["missing_usage"] = {field: max(0, value - count) for field, value in missing.items()}
 
 
 def recording_directory(root, run_id):
@@ -22,12 +57,14 @@ def recording_directory(root, run_id):
 def recording_lists(root, public_root):
     public = summaries(public_root)
     for run in public:
+        reconcile_rate_rejections(run, public_root / run["id"])
         run["comment"] = read_comment(public_root / run["id"])
     published = {run["id"]: run for run in public}
     local = summaries(root)
     for run in local:
         run_id = run["id"]
         directory = root / run_id
+        reconcile_rate_rejections(run, directory)
         run["published_locally"] = (directory / ".published-locally").is_file()
         run["published_to_git"] = run_id in published
         run["same_public_replay"] = (run["published_to_git"]
@@ -134,11 +171,25 @@ def publish(root, public_root, run_id, destination, enabled):
             raise
 
 
-def delete_recording(root, public_root, run_id):
+def delete_unpublished(root, public_root, ids):
+    deleted, skipped = [], []
+    for id in ids:
+        try:
+            delete_recording(root, public_root, id, unpublished_only=True)
+        except (ValueError, OSError):
+            skipped.append(id)
+        else:
+            deleted.append(id)
+    return {"deleted": deleted, "skipped": skipped}
+
+
+def delete_recording(root, public_root, run_id, *, unpublished_only=False):
     directory = recording_directory(root, run_id)
     with Record.acquire(directory):
         if (public_root / run_id).exists():
             raise ValueError("Git-published recordings cannot be deleted here.")
+        if unpublished_only and (directory / ".published-locally").is_file():
+            raise ValueError("This recording is published locally.")
         summary_path = directory / "summary.json"
         if summary_path.is_symlink() or not summary_path.is_file():
             raise ValueError("This recording is missing its summary.")

@@ -76,7 +76,7 @@ class ProfileTests(unittest.TestCase):
                     "id": "call", "type": "function", "function": {"name": "read", "arguments": "{}"},
                 }]}, {"prompt_tokens": 10, "completion_tokens": 5, "cost": 0.0005})
                 run = api("launch", {"level": "word_jumble", "mode": "model", "profile_id": paid["id"],
-                                     "rounds": 1}, expected=202)
+                                     "rounds": 1, "pacing": {"rpm": 18}}, expected=202)
                 launcher.stop_run(run["id"])
                 launcher.wait(5)
                 key, settings = adapter.call_args.args
@@ -84,6 +84,7 @@ class ProfileTests(unittest.TestCase):
                 self.assertEqual((settings.backend, settings.model, settings.rounds, settings.max_completion_tokens),
                                  ("openrouter", "google/gemini-3.5-flash-lite", 1, 500))
                 saved = launcher.root / run["id"]
+                self.assertEqual(json.loads((saved / "summary.json").read_text())["request_rpm"], 18)
                 self.assertEqual(json.loads((saved / "summary.json").read_text())["profile_name"], "Paid renamed")
                 self.assertEqual(json.loads((saved / "summary.json").read_text())["characters"],
                                  {"1": {"name": "Ann", "badge": "A", "sprite": "rocket"}})

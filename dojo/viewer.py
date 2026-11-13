@@ -9,7 +9,7 @@ from dojo.catalog import OpenRouterCatalog
 from dojo.config import DEFAULT_DEMO_ROUNDS, MAX_ROUNDS, Settings, agent_limits
 from dojo.launcher import RunBusy
 from dojo.level import LEVELS, available_levels, load_level
-from dojo.publication import MAX_COMMENT_LENGTH, delete_recording, publish, recording_directory, recording_lists, save_comment
+from dojo.publication import MAX_COMMENT_LENGTH, delete_recording, delete_unpublished, publish, recording_directory, recording_lists, save_comment
 from dojo.runner import Agent, HARNESS_VERSION
 from dojo.storage import RUN_ID, frames
 from dojo.wire import decode
@@ -74,8 +74,9 @@ def serve(root, port, launcher=None, *, autoplay_latest=False, public_root=None)
         def do_POST(self):
             publishing = self.path == "/api/publish"
             deleting = self.path == "/api/delete-recording"
+            bulk_deleting = self.path == "/api/delete-unpublished"
             commenting = self.path == "/api/comment"
-            updating_recording = publishing or deleting or commenting
+            updating_recording = publishing or deleting or commenting or bulk_deleting
             collection, _, action = self.path.removeprefix("/api/").partition("/")
             updating_profile = self.path.startswith("/api/") and collection in ("profiles", "teams") and action in ("save", "delete")
             if not launcher or (not (updating_recording or updating_profile) and self.path not in ("/api/launch", "/api/stop", "/api/pause", "/api/resume", "/api/continue")):
@@ -94,11 +95,23 @@ def serve(root, port, launcher=None, *, autoplay_latest=False, public_root=None)
                 fields.add("comment")
             try:
                 length = int(self.headers.get("Content-Length", "0"))
-                max_length = 12 * MAX_COMMENT_LENGTH + 256 if commenting else 1024
+                max_length = 1024 * 1024 if bulk_deleting else 12 * MAX_COMMENT_LENGTH + 256 if commenting else 1024
                 if self.headers.get_content_type() != "application/json" or not 0 < length <= max_length:
                     raise ValueError
                 data = decode(self.rfile.read(length))
+                if bulk_deleting:
+                    ids = data.get("ids") if isinstance(data, dict) and data.keys() == {"ids"} else None
+                    if not isinstance(ids, list) or not ids or not all(
+                        isinstance(id, str) and RUN_ID.fullmatch(id) for id in ids
+                    ):
+                        raise ValueError
+                    with recording_updates:
+                        result = delete_unpublished(root, public_root, dict.fromkeys(ids))
+                    self.send_json(result)
+                    return
                 optional = {"rounds"} if launching or self.path in ("/api/resume", "/api/continue") else set()
+                if launching or self.path in ("/api/resume", "/api/continue"):
+                    optional.add("pacing")
                 if launching:
                     optional.update(("profile_id", "team_id", "squad", "team_revision"))
                 if publishing:
@@ -113,6 +126,8 @@ def serve(root, port, launcher=None, *, autoplay_latest=False, public_root=None)
                 if "squad" in data and not isinstance(data["squad"], list):
                     raise ValueError
                 if publishing and type(data.get("enabled")) is not bool:
+                    raise ValueError
+                if "pacing" in data and (not isinstance(data["pacing"], dict) or data["pacing"].keys() != {"rpm"}):
                     raise ValueError
             except (ValueError, RecursionError):
                 error = "Expected a puzzle and run mode." if launching else "Expected a run ID."
@@ -134,15 +149,16 @@ def serve(root, port, launcher=None, *, autoplay_latest=False, public_root=None)
                 elif launching:
                     run_id = launcher.launch(data["level"], data["mode"], rounds=data.get("rounds"),
                                              profile_id=data.get("profile_id"), team_id=data.get("team_id"),
-                                             squad=data.get("squad"), team_revision=data.get("team_revision"))
+                                             squad=data.get("squad"), team_revision=data.get("team_revision"),
+                                             pacing=data.get("pacing"))
                 else:
                     run_id = data["id"]
                     if self.path == "/api/pause":
                         launcher.pause_run(run_id)
                     elif self.path == "/api/resume":
-                        launcher.resume_run(run_id, rounds=data.get("rounds"))
+                        launcher.resume_run(run_id, rounds=data.get("rounds"), pacing=data.get("pacing"))
                     elif self.path == "/api/continue":
-                        launcher.start_saved(run_id, rounds=data.get("rounds"))
+                        launcher.start_saved(run_id, rounds=data.get("rounds"), pacing=data.get("pacing"))
                     else:
                         launcher.stop_run(run_id)
             except ValueError as error:
