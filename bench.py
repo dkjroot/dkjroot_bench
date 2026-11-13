@@ -7,6 +7,8 @@ from pathlib import Path
 from dojo.config import BACKEND_KEYS, Settings
 from dojo.launcher import Launcher
 from dojo.level import available_levels
+from dojo.profiles import Profiles
+from dojo.teams import Teams
 from dojo.viewer import serve
 
 PROJECT = Path(__file__).resolve().parent
@@ -29,14 +31,16 @@ def main():
 
     try:
         settings = Settings.read(path) if path else Settings()
+        profiles = None if args.no_viewer else Profiles(PROJECT / "model-profiles.json")
         launcher = Launcher(settings, args.runs_dir, os.environ.get(BACKEND_KEYS[settings.backend]),
-                            interactive=not args.no_viewer, allow_demo=args.demo)
+                            interactive=not args.no_viewer, allow_demo=args.demo,
+                            profiles=profiles, teams=Teams(PROJECT / "team-profiles.json", profiles) if profiles else None)
         args.runs_dir.mkdir(parents=True, exist_ok=True)
         if not args.no_viewer:
             server = serve(args.runs_dir, args.port, launcher, autoplay_latest=not args.serve)
             print(f"Spectator view at http://127.0.0.1:{server.server_port} · Ctrl+C to stop",
                   flush=True)
-        if not args.serve:
+        if not args.serve and (args.demo or args.no_viewer or launcher.model):
             overrides = {"model": "demo"} if args.demo else {}
             launcher.start(settings.for_level(args.level or settings.level, **overrides))
         if server:

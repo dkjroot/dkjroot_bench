@@ -1,1 +1,0 @@
-The model understood the assignment, but it hallucinated successful completion and so didn't quite finish. Cost estimate was prior to implementing cache hit recording so is not accurate.

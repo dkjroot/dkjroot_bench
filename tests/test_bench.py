@@ -4,6 +4,7 @@ import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from threading import Event
+from urllib.error import HTTPError
 from unittest.mock import Mock, patch
 
 from dojo.config import Settings
@@ -141,12 +142,17 @@ class HarnessTests(unittest.TestCase):
         one, two, three = run.agents.values()
         self.assertIsNot(one.history, two.history)
         self.assertEqual(one.history, [{"role": "user", "content": "Solve the puzzle."}])
+        self.assertEqual(run.dispatch(one, "whoAmI", {}), {"id": "1", "name": "Ann"})
+        self.assertEqual(run.dispatch(one, "listAgents", {}), {
+            "agents": [{"id": "1", "name": "Ann"}, {"id": "2", "name": "Ben"}, {"id": "3", "name": "Cat"}],
+        })
         run.apply_reply(one, reply(call("look", "{}"), reasoning_details=[{"id": "private"}]))
-        run.apply_reply(one, reply(call("messageOtherAgent", '{"agent":"2","message":"hello"}')))
+        run.apply_reply(one, reply(call("messageOtherAgent", '{"agent":"ben","message":"hello"}')))
         self.assertEqual(len(two.history), 1)
         run.deliver_mail(run.agents.values())
         self.assertEqual(two.history[-1]["role"], "user")
-        self.assertEqual(json.loads(two.history[-1]["content"]), {"messages": [{"from": "1", "text": "hello"}]})
+        self.assertEqual(json.loads(two.history[-1]["content"]),
+                         {"messages": [{"from": "1", "from_name": "Ann", "text": "hello"}]})
         self.assertEqual(len(three.history), 1)
         self.assertEqual(one.history[1]["reasoning_details"], [{"id": "private"}])
         self.assertNotIn("private", json.dumps(two.history))
@@ -221,7 +227,10 @@ class HarnessTests(unittest.TestCase):
             summary = run.execute()
 
         observation = json.loads(requests[1][-1]["content"])
-        self.assertEqual(observation["agents"], [{"id": "2", "dx": 6, "dy": 0}, {"id": "4", "dx": 0, "dy": 0}])
+        self.assertEqual(observation["agents"], [
+            {"id": "2", "name": "Ben", "dx": 6, "dy": 0},
+            {"id": "4", "name": "Dug", "dx": 0, "dy": 0},
+        ])
         self.assertEqual(set(observation), {"grid", "carrying", "agents"})
         for index in (2, 4, 5, 6):
             self.assertEqual(requests[index][-1], {"role": "user", "content": CONTINUE_PROMPT})
@@ -295,9 +304,14 @@ class HarnessTests(unittest.TestCase):
                 self.assertNotIn("x and o", request.data.decode().lower())
             if calls:
                 self.assertEqual(history[-1]["tool_call_id"], f"call_{calls}")
+                previous = history[-2]["tool_calls"][0]
+                self.assertNotIn("index", previous)
+                self.assertEqual(previous["extra_content"], {"google": {"thought_signature": f"signature-{calls}"}})
             name, arguments = next(plans)
             calls += 1
-            message = {"tool_calls": [call(name, json.dumps(arguments), f"call_{calls}")]}
+            tool_call = call(name, json.dumps(arguments), f"call_{calls}")
+            tool_call.update(index=0, extra_content={"google": {"thought_signature": f"signature-{calls}"}})
+            message = {"tool_calls": [tool_call]}
             return io.BytesIO(json.dumps({
                 "choices": [{"message": message}],
                 "model": "example/model", "provider": "fixture",
@@ -315,6 +329,15 @@ class HarnessTests(unittest.TestCase):
 
 
 class TransportTests(unittest.TestCase):
+    def test_openrouter_http_error_includes_the_redacted_response_message(self):
+        backend = OpenRouter("fixture-key", Settings(model="example/model"))
+        error = HTTPError(backend.url, 404, "Not Found", None, io.BytesIO(json.dumps({
+            "error": {"message": "No eligible endpoints for fixture-key."},
+        }).encode()))
+        with patch("dojo.models.request_json", side_effect=error):
+            reply = backend.complete([], [])
+        self.assertEqual(reply.error, "OpenRouter HTTP 404: No eligible endpoints for [redacted].")
+
     def test_request_contains_only_agent_context_and_tools(self):
         settings = Settings(model="example/model", provider="test", reasoning_effort="low")
         backend = OpenRouter("test-key", settings)
@@ -328,6 +351,10 @@ class TransportTests(unittest.TestCase):
         body = json.loads(request.data)
         self.assertEqual(body["messages"], [{"role": "user", "content": "Solve the puzzle."}])
         self.assertEqual(body["tools"], [])
+        self.assertEqual(body["max_tokens"], settings.max_completion_tokens)
+        self.assertNotIn("max_completion_tokens", body)
+        self.assertNotIn("parallel_tool_calls", body)
+        self.assertTrue(body["provider"]["require_parameters"])
         self.assertEqual(body["provider"]["only"], ["test"])
         self.assertEqual(body["plugins"], [
             {"id": "web", "enabled": False}, {"id": "response-healing", "enabled": False},

@@ -46,7 +46,11 @@ def parse_arguments(raw):
 
 
 def valid_call(call):
-    if not isinstance(call, dict) or call.keys() != {"id", "type", "function"}:
+    required = {"id", "type", "function"}
+    if not isinstance(call, dict) or not required <= call.keys() <= required | {"extra_content"}:
+        return False
+    # Gemini's OpenAI-compatible tool calls can carry an opaque thought signature.
+    if "extra_content" in call and not isinstance(call["extra_content"], dict):
         return False
     call_id, function = call["id"], call["function"]
     return (call["type"] == "function"

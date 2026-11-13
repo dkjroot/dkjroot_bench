@@ -6,21 +6,23 @@ from dataclasses import asdict, dataclass, field
 from threading import Condition
 from time import monotonic
 
-from dojo.config import validate_rounds
+from dojo.config import TEAM, validate_rounds
 from dojo.level import ImageObservation, Level, load_level, tool, validate_arguments
 from dojo.models import Reply
 from dojo.storage import Record, now
+from dojo.teams import default_characters
 from dojo.wire import MAX_CALLS_PER_REPLY, TOOL_NAME, parse_arguments, valid_call
 
 HARNESS_VERSION = 3
 HALT_RETRIES = 3
 CONTINUE_PROMPT = "Continue. Choose one of your tools and call it."
-AGENT_ID = {"type": "string", "minLength": 1, "maxLength": 2}
+RECIPIENT = {"type": "string", "minLength": 1, "maxLength": 40}
 MESSAGE = {"type": "string", "minLength": 1, "maxLength": 1000}
 COMMUNICATION = (
-    tool("whoAmI", "Return your agent ID."),
-    tool("listAgents", "List the agent IDs in this session."),
-    tool("messageOtherAgent", "Send a message to one other agent.", agent=AGENT_ID, message=MESSAGE),
+    tool("whoAmI", "Return your name and agent ID."),
+    tool("listAgents", "List the agent names and IDs in this session."),
+    tool("messageOtherAgent", "Send a message to one other agent by name or ID.",
+         agent=RECIPIENT, message=MESSAGE),
     tool("messageAllOtherAgents", "Send a message to all other agents.", message=MESSAGE),
 )
 USAGE_FIELDS = {
@@ -29,6 +31,11 @@ USAGE_FIELDS = {
     "total_tokens": "total_tokens",
     "cost_usd": "cost",
 }
+
+
+def usage_metrics():
+    return {"requests": 0, **dict.fromkeys(USAGE_FIELDS, 0),
+            "missing_usage": dict.fromkeys(USAGE_FIELDS, 0)}
 
 
 class RunBusy(Exception):
@@ -56,8 +63,13 @@ class Agent:
 
 
 class Run:
-    def __init__(self, settings, root, stop, backend=None, *, interactive=False, restoring=False):
+    def __init__(self, settings, root, stop, backend=None, *, interactive=False, restoring=False,
+                 profile_id=None, profile_name=None, team=None, team_profiles=None):
         self.settings = settings
+        self.profile_id = profile_id
+        self.team = team
+        self.team_profiles = team_profiles
+        self.team_models = {}
         self.stop = stop
         self.backend = backend
         self.interactive = interactive
@@ -74,6 +86,7 @@ class Run:
         seed = settings.seed if settings.seed is not None else secrets.randbits(48)
         self.agents = {str(i): Agent(str(i), [{"role": "user", "content": self.module.GOAL}])
                        for i in range(1, settings.agents + 1)}
+        self.characters = team["agents"] if team else default_characters(self.agents)
         self.puzzle: Level = self.module.Puzzle(seed, list(self.agents))
         self.advance_world = getattr(self.puzzle, "advance_round", None)
         common_tools = COMMUNICATION if getattr(self.module, "USE_COMMUNICATION", True) else ()
@@ -88,11 +101,9 @@ class Run:
         self.round = 0
         self.round_open = False
         self.round_replies = {}
-        self.metrics = {
-            "requests": 0, "tool_calls": 0, "halts": 0,
-            **dict.fromkeys(USAGE_FIELDS, 0),
-            "missing_usage": dict.fromkeys(USAGE_FIELDS, 0),
-        }
+        self.metrics = {**usage_metrics(), "tool_calls": 0, "halts": 0}
+        if team:
+            self.metrics["agent_usage"] = {id: usage_metrics() for id in self.agents}
         self.models = set()
         self.providers = set()
         self.errors = {}
@@ -106,11 +117,16 @@ class Run:
             "harness_version": HARNESS_VERSION,
             "automatic_mail": bool(common_tools),
             "started_at": now().isoformat(), "status": "running",
+            **({"profile_name": profile_name} if profile_name else {}),
+            **({"team": team} if team else {}),
+            **({"characters": self.characters} if not team and settings.model != "demo" else {}),
         })
 
     def save_checkpoint(self, agents=None):
         self.record.checkpoint({
             "version": 1, "round": self.round, "elapsed_seconds": self.elapsed(),
+            "profile_id": self.profile_id,
+            **({"team_profiles": self.team_profiles, "team_models": self.team_models} if self.team else {}),
             "message_id": self.message_id, "metrics": self.metrics,
             "models": sorted(self.models), "providers": sorted(self.providers),
             "agents": agents if agents is not None else [asdict(agent) for agent in self.agents.values()],
@@ -121,7 +137,9 @@ class Run:
 
     @classmethod
     def restore(cls, settings, directory, summary, checkpoint, stop, backend, lock):
-        run = cls(settings, directory.parent, stop, backend, interactive=True, restoring=True)
+        run = cls(settings, directory.parent, stop, backend, interactive=True, restoring=True,
+                  profile_id=checkpoint.get("profile_id"), team=summary.get("team") if settings.backend == TEAM else None,
+                  team_profiles=checkpoint.get("team_profiles"))
         if (checkpoint.get("version") != 1 or summary.get("harness_version") != HARNESS_VERSION
                 or summary.get("level_version") != run.module.VERSION or summary.get("id") != directory.name):
             raise ValueError("This checkpoint requires the original level and runner version.")
@@ -142,6 +160,7 @@ class Run:
         run.message_id = checkpoint["message_id"]
         run.metrics = checkpoint["metrics"]
         run.models, run.providers = set(checkpoint["models"]), set(checkpoint["providers"])
+        run.team_models = checkpoint.get("team_models", {})
         run.agents = {data["id"]: Agent(**data) for data in checkpoint["agents"]}
         for agent in run.agents.values():
             if agent.status == "thinking":
@@ -154,6 +173,9 @@ class Run:
         run.restored = True
         return run
 
+    def agent_identity(self, id):
+        return {"id": id, "name": self.characters[id]["name"]}
+
     def dispatch(self, agent, name, arguments):
         if name not in self.definitions:
             return {"error": "Unknown tool."}
@@ -161,11 +183,18 @@ class Run:
         if error:
             return {"error": error}
         if name == "whoAmI":
-            return {"id": agent.id}
+            return self.agent_identity(agent.id)
         if name == "listAgents":
-            return {"agents": list(self.agents)}
+            return {"agents": [self.agent_identity(id) for id in self.agents]}
         if name == "messageOtherAgent":
-            recipient = arguments["agent"]
+            recipient = arguments["agent"].strip()
+            if recipient not in self.agents:
+                matches = [id for id, character in self.characters.items()
+                           if character["name"].casefold() == recipient.casefold()]
+                if len(matches) > 1:
+                    return {"error": "More than one agent has that name. Choose an ID from listAgents."}
+                if matches:
+                    recipient = matches[0]
             if recipient == agent.id or recipient not in self.agents:
                 return {"error": "Choose another agent from listAgents."}
             return self.send(agent, [recipient], arguments["message"])
@@ -174,6 +203,9 @@ class Run:
                              arguments["message"])
         result = self.puzzle.act(agent.id, name, arguments)
         if name == self.observation_tool and isinstance(result, dict) and "error" not in result:
+            if "agents" in result:
+                result["agents"] = [{**other, "name": self.characters[other["id"]]["name"]}
+                                    for other in result["agents"]]
             agent.last_look = result
         return result
 
@@ -193,7 +225,8 @@ class Run:
                 continue
             messages, agent.inbox = agent.inbox, []
             agent.history.append({"role": "user", "content": json.dumps({
-                "messages": [{"from": message["from"], "text": message["text"]} for message in messages],
+                "messages": [{"from": message["from"], "from_name": self.characters[message["from"]]["name"],
+                              "text": message["text"]} for message in messages],
             }, ensure_ascii=False)})
             deliveries[agent.id] = [message["id"] for message in messages]
         if deliveries:
@@ -235,8 +268,15 @@ class Run:
             self.update_score()
             self.frame("tick", messages=messages)
 
+    def agent_backend(self, agent):
+        return self.team["agents"][agent.id]["settings"]["backend"] if self.team else self.settings.backend
+
     def record_usage(self, agent, reply, *, track_model=True):
-        self.metrics["requests"] += 1 + reply.rate_limit_retries
+        metrics = [self.metrics]
+        if self.team:
+            metrics.append(self.metrics["agent_usage"][agent.id])
+        for entry in metrics:
+            entry["requests"] += 1 + reply.rate_limit_retries
         usage = reply.usage if isinstance(reply.usage, dict) else {}
         for metric, key in USAGE_FIELDS.items():
             value = usage.get(key)
@@ -246,9 +286,11 @@ class Run:
                     value = prompt + completion
             if (type(value) is int or (metric == "cost_usd" and type(value) is float)
                     and math.isfinite(value)) and value >= 0:
-                self.metrics[metric] += value
+                for entry in metrics:
+                    entry[metric] += value
             else:
-                self.metrics["missing_usage"][metric] += 1
+                for entry in metrics:
+                    entry["missing_usage"][metric] += 1
         if track_model and reply.model:
             if self.models and reply.model not in self.models:
                 self.errors[agent.id] = "The model API reported more than one model for the run."
@@ -259,8 +301,9 @@ class Run:
         recorded_usage = {key: usage[key] for key in USAGE_FIELDS.values()
                           if type(usage.get(key)) in (int, float)}
         cached = usage.get("cached_prompt_tokens")
-        if self.settings.backend == "gemini" and type(cached) is int and cached >= 0:
-            self.metrics["cached_input_tokens"] = self.metrics.get("cached_input_tokens", 0) + cached
+        if self.agent_backend(agent) == "gemini" and type(cached) is int and cached >= 0:
+            for entry in metrics:
+                entry["cached_input_tokens"] = entry.get("cached_input_tokens", 0) + cached
             recorded_usage["cached_prompt_tokens"] = cached
         self.frame("request", agent=agent.id, model=reply.model, provider=reply.provider,
                    generation_id=reply.generation_id, seconds=reply.seconds,
@@ -287,7 +330,7 @@ class Run:
             return
         message = reply.message
         calls = message.get("tool_calls") or []
-        thought = reply.thought_summary or message.get("reasoning")
+        thought = reply.thought_summary or message.get("reasoning") or message.get("reasoning_content")
         details = message.get("reasoning_details")
         if not thought and isinstance(details, list):
             thought = next((detail.get("summary") or detail.get("text") for detail in details
@@ -299,9 +342,15 @@ class Run:
         content = message.get("content")
         continuation = {key: message[key] for key in ("reasoning", "reasoning_details")
                         if message.get(key) is not None}
+        backend = self.agent_backend(agent)
+        if backend == "anthropic" and message.get("anthropic_content"):
+            continuation["anthropic_content"] = message["anthropic_content"]
+        if backend == "deepseek" and isinstance(message.get("reasoning_content"), str):
+            continuation["reasoning_content"] = message["reasoning_content"]
         if reply.native_content is not None:
             continuation["native_content"] = reply.native_content
-        if calls or (isinstance(content, str) and content.strip()) or (reply.native_content or {}).get("parts"):
+        if (calls or (isinstance(content, str) and content.strip()) or (reply.native_content or {}).get("parts")
+                or continuation.get("reasoning_content") or continuation.get("anthropic_content")):
             turn = {"role": "assistant", "content": content if isinstance(content, str) else None, **continuation}
             if calls:
                 turn["tool_calls"] = calls
@@ -346,7 +395,8 @@ class Run:
 
     def request_reply(self, agent):
         if not self.stop.is_set():
-            return self.backend.complete(agent.history, self.tools)
+            backend = self.backend[agent.id] if self.team else self.backend
+            return backend.complete(agent.history, self.tools)
 
     def control_state(self):
         with self.control:
@@ -417,26 +467,50 @@ class Run:
             self.record.save_summary()
             return True
 
+    def reply_models(self, agents, replies):
+        # Each profile may resolve to a different model. Its agents must agree on the resolved version.
+        models = {}
+        if self.team:
+            models.update({id: {model} for id, model in self.team_models.items()})
+        elif self.models:
+            models[None] = set(self.models)
+        known = set(models)
+        for agent, reply in zip(agents, replies):
+            group = self.team_profiles[agent.id] if self.team else None
+            if group not in known and reply and reply.model and not self.reply_error(reply):
+                models.setdefault(group, set()).add(reply.model)
+        return models
+
+    def collect_replies(self, agents, replies, *, retain):
+        models = self.reply_models(agents, replies)
+        for agent, reply in zip(agents, replies):
+            if reply is None:
+                continue
+            self.record_usage(agent, reply, track_model=False)
+            group = self.team_profiles[agent.id] if self.team else None
+            expected = models.get(group, set())
+            error = self.reply_error(reply)
+            if reply.model and (len(expected) > 1 or (expected and reply.model not in expected)):
+                scope = "this profile" if self.team else "the run"
+                error = error or f"The model API reported more than one model for {scope}."
+                self.errors[agent.id] = error
+            if reply.model and (not retain or not error):
+                self.models.add(reply.model)
+            if not error:
+                if self.team and reply.model:
+                    self.team_models[group] = reply.model
+                if retain:
+                    self.round_replies[agent.id] = reply
+            elif retain:
+                self.errors[agent.id] = error
+
     def interactive_replies(self, pool, active):
         while not self.stop.is_set():
             pending = [agent for agent in active if agent.id not in self.round_replies]
             futures = [pool.submit(self.request_reply, agent) for agent in pending]
             replies = [future.result() for future in futures]
-            models = self.models or {reply.model for reply in replies if reply and reply.model and not self.reply_error(reply)}
             self.errors.clear()
-            for agent, reply in zip(pending, replies):
-                if reply is None:
-                    continue
-                self.record_usage(agent, reply, track_model=False)
-                error = self.reply_error(reply)
-                if reply.model and (len(models) > 1 or (models and reply.model not in models)):
-                    error = error or "The model API reported more than one model for the run."
-                if error:
-                    self.errors[agent.id] = error
-                else:
-                    self.round_replies[agent.id] = reply
-                    if reply.model:
-                        self.models.add(reply.model)
+            self.collect_replies(pending, replies, retain=True)
             if self.stop.is_set():
                 break
             if not self.errors:
@@ -464,12 +538,15 @@ class Run:
                 else:
                     pending = [pool.submit(self.request_reply, agent) for agent in active]
                     replies = [request.result() for request in pending]
-                    for agent, reply in zip(active, replies):
-                        if reply is not None:
-                            self.record_usage(agent, reply)
+                    if self.team:
+                        self.collect_replies(active, replies, retain=False)
+                    else:
+                        for agent, reply in zip(active, replies):
+                            if reply is not None:
+                                self.record_usage(agent, reply)
                 if self.stop.is_set():
                     return "interrupted"
-                if len(self.models) > 1:
+                if (not self.team and len(self.models) > 1) or (self.team and self.errors):
                     return "error"
                 for agent, reply in zip(active, replies):
                     if self.won or (not self.interactive and self.stop.is_set()):

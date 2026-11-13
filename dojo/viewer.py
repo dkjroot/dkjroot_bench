@@ -5,7 +5,8 @@ from pathlib import Path
 from threading import Lock
 from urllib.parse import parse_qs, urlsplit
 
-from dojo.config import DEFAULT_DEMO_ROUNDS, MAX_ROUNDS, Settings
+from dojo.catalog import OpenRouterCatalog
+from dojo.config import DEFAULT_DEMO_ROUNDS, MAX_ROUNDS, Settings, agent_limits
 from dojo.launcher import RunBusy
 from dojo.level import LEVELS, available_levels, load_level
 from dojo.publication import MAX_COMMENT_LENGTH, delete_recording, publish, recording_directory, recording_lists, save_comment
@@ -19,6 +20,8 @@ STATIC = {
     "/style.css": ("style.css", "text/css; charset=utf-8"),
     "/app.js": ("app.js", "text/javascript; charset=utf-8"),
     "/agent-sprites.js": ("agent-sprites.js", "text/javascript; charset=utf-8"),
+    "/teams.js": ("teams.js", "text/javascript; charset=utf-8"),
+    "/squad.js": ("squad.js", "text/javascript; charset=utf-8"),
 }
 
 
@@ -29,12 +32,16 @@ def serve(root, port, launcher=None, *, autoplay_latest=False, public_root=None)
     settings = launcher.settings if launcher else Settings()
     preview_seed = settings.seed if settings.seed is not None else randbits(48)
     recording_updates = Lock()
+    model_catalog = OpenRouterCatalog()
     levels = []
     for name in available_levels():
         level = load_level(name)
+        minimum, maximum = agent_limits(level)
         levels.append({
             "id": name, "title": level.TITLE, "version": level.VERSION,
             "demo": hasattr(level, "demo"),
+            "model_rounds": getattr(level, "DEFAULT_MODEL_ROUNDS", 60),
+            "min_agents": minimum, "max_agents": maximum, "default_agents": level.DEFAULT_AGENTS,
         })
 
     class Handler(BaseHTTPRequestHandler):
@@ -69,11 +76,17 @@ def serve(root, port, launcher=None, *, autoplay_latest=False, public_root=None)
             deleting = self.path == "/api/delete-recording"
             commenting = self.path == "/api/comment"
             updating_recording = publishing or deleting or commenting
-            if not launcher or (not updating_recording and self.path not in ("/api/launch", "/api/stop", "/api/pause", "/api/resume", "/api/continue")):
+            collection, _, action = self.path.removeprefix("/api/").partition("/")
+            updating_profile = self.path.startswith("/api/") and collection in ("profiles", "teams") and action in ("save", "delete")
+            if not launcher or (not (updating_recording or updating_profile) and self.path not in ("/api/launch", "/api/stop", "/api/pause", "/api/resume", "/api/continue")):
                 self.send_error(404)
                 return
             if not self.valid_host() or self.headers.get("Origin") != "http://" + self.headers["Host"]:
                 self.send_error(403)
+                return
+            if updating_profile:
+                self.update_profile(getattr(launcher, collection), action,
+                                    "model" if collection == "profiles" else "team")
                 return
             launching = self.path == "/api/launch"
             fields = {"level", "mode"} if launching else {"id", "destination"} if publishing else {"id"}
@@ -86,12 +99,18 @@ def serve(root, port, launcher=None, *, autoplay_latest=False, public_root=None)
                     raise ValueError
                 data = decode(self.rfile.read(length))
                 optional = {"rounds"} if launching or self.path in ("/api/resume", "/api/continue") else set()
+                if launching:
+                    optional.update(("profile_id", "team_id", "squad", "team_revision"))
                 if publishing:
                     optional = {"enabled"}
                 if (not isinstance(data, dict) or not fields <= data.keys() <= (fields | optional)
                         or not all(isinstance(data[key], str) for key in fields)):
                     raise ValueError
                 if not launching and not RUN_ID.fullmatch(data["id"]):
+                    raise ValueError
+                if any(key in data and not isinstance(data[key], str) for key in ("profile_id", "team_id", "team_revision")):
+                    raise ValueError
+                if "squad" in data and not isinstance(data["squad"], list):
                     raise ValueError
                 if publishing and type(data.get("enabled")) is not bool:
                     raise ValueError
@@ -113,7 +132,9 @@ def serve(root, port, launcher=None, *, autoplay_latest=False, public_root=None)
                     with recording_updates:
                         comment = save_comment(root, public_root, run_id, data["comment"])
                 elif launching:
-                    run_id = launcher.launch(data["level"], data["mode"], rounds=data.get("rounds"))
+                    run_id = launcher.launch(data["level"], data["mode"], rounds=data.get("rounds"),
+                                             profile_id=data.get("profile_id"), team_id=data.get("team_id"),
+                                             squad=data.get("squad"), team_revision=data.get("team_revision"))
                 else:
                     run_id = data["id"]
                     if self.path == "/api/pause":
@@ -139,6 +160,34 @@ def serve(root, port, launcher=None, *, autoplay_latest=False, public_root=None)
                     response["run_state"] = launcher.run_state()
                 self.send_json(response, 202)
 
+        def update_profile(self, store, action, kind):
+            if store is None:
+                self.send_error(404)
+                return
+            try:
+                length = int(self.headers.get("Content-Length", "0"))
+                if self.headers.get_content_type() != "application/json" or not 0 < length <= 8192:
+                    raise ValueError(f"Expected {kind} profile settings.")
+                try:
+                    data = decode(self.rfile.read(length))
+                except (ValueError, RecursionError) as error:
+                    raise ValueError(f"Expected {kind} profile settings.") from error
+                if action == "save":
+                    result = store.save(data)
+                else:
+                    if not isinstance(data, dict) or data.keys() != {"id"}:
+                        raise ValueError(f"Choose a {kind} profile.")
+                    store.delete(data["id"])
+                    result = {"id": data["id"]}
+            except ValueError as error:
+                self.send_json({"error": str(error)}, 400)
+            except BlockingIOError as error:
+                self.send_json({"error": str(error)}, 409)
+            except OSError:
+                self.send_json({"error": f"Could not save {kind} profiles."}, 500)
+            else:
+                self.send_json(result)
+
         def do_GET(self):
             if not self.valid_host():
                 self.send_error(403)
@@ -160,12 +209,32 @@ def serve(root, port, launcher=None, *, autoplay_latest=False, public_root=None)
                     "autoplay_latest": autoplay_latest,
                     "default_level": settings.level,
                     "can_pause": bool(launcher and launcher.interactive),
+                    "can_manage_profiles": bool(launcher and launcher.profiles is not None),
+                    "can_manage_teams": bool(launcher and launcher.teams is not None),
                     "max_rounds": MAX_ROUNDS,
                     "model": model,
                     "round_defaults": {"demo": DEFAULT_DEMO_ROUNDS,
                                        "model": launcher.settings.rounds if model else None},
                     **state,
                 })
+                return
+            if url.path == "/api/profiles" and launcher and launcher.profiles is not None:
+                try:
+                    self.send_json(launcher.profiles.list())
+                except OSError:
+                    self.send_json({"error": "Could not load model profiles."}, 500)
+                return
+            if url.path == "/api/openrouter-models" and launcher and launcher.profiles is not None:
+                try:
+                    self.send_json(model_catalog.list(refresh=url.query == "refresh=1"))
+                except OSError:
+                    self.send_json({"error": "Could not load the OpenRouter catalog."}, 502)
+                return
+            if url.path == "/api/teams" and launcher and launcher.teams is not None:
+                try:
+                    self.send_json(launcher.teams.list())
+                except OSError:
+                    self.send_json({"error": "Could not load team profiles."}, 500)
                 return
             if url.path in ("/api/runs", "/api/recordings"):
                 lists = recording_lists(root, public_root)

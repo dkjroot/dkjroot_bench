@@ -22,8 +22,8 @@ parser.add_argument("--provider", help="pin a specific OpenRouter provider slug"
 parser.add_argument("--gemini-input-tpm", type=int, help="Gemini input tokens per minute for your project and model")
 parser.add_argument("--gemini-rpm", type=int, help="Gemini requests per minute for your project and model")
 parser.add_argument("--gemini-thought-summaries", action="store_true", help="request Gemini thought summaries for the replay")
-parser.add_argument("--reasoning-effort", choices=("none", "minimal", "low", "medium", "high", "xhigh"),
-                    help="set reasoning effort for an OpenRouter model")
+parser.add_argument("--reasoning-effort", choices=("none", "minimal", "low", "medium", "high", "xhigh", "max"),
+                    help="set reasoning effort where supported by the API and model")
 parser.add_argument("--demo-delay", type=float, default=Settings.demo_delay, metavar="SECONDS")
 args = vars(parser.parse_args())
 output = args.pop("output")

@@ -77,8 +77,52 @@ what the agent was working with.
 
 ## Try it with a model
 
-You can run a puzzle with a Gemini API key from Google AI Studio or with an
-OpenRouter API key. Use a model that can call tools.
+Start the viewer with `python3 bench.py --serve` and open **Model profiles**.
+Choose a preset or click **New profile**. Paste the API key you want that
+profile to use, then save it. Back on **Spectate**, pick a puzzle, choose the
+profile from **Model or team**, and click **Run model**.
+
+When you run a single model profile, the agents get the default names and
+sprites, from Ann (A) through Han (H). In puzzles with messaging, agents
+can look up each other's names and use them to send messages.
+
+There are OpenRouter presets and profiles that call Google Gemini, OpenAI,
+Anthropic, xAI and DeepSeek directly. Each profile gets its own key, so you
+can set up the same OpenRouter model twice with keys that have different
+spending limits. In a profile you can set the default round limit, the most
+tokens a reply can use, the request timeout and any settings for that API.
+**Max rounds** on the run screen lets you override the profile for one run.
+Use a model that can call tools. Ball Machine also needs image input.
+
+Keys are saved in `model-profiles.json` on this machine. Keep that file private.
+It's ignored by Git, and the viewer keeps keys out of run recordings. Edit a
+profile to replace or remove its key. A saved run uses its original profile
+and the run settings from its recording when you resume it.
+
+**Model profiles** also loads the public OpenRouter catalog. Search by name
+or model ID, filter for tool calling or image input, and sort by price or
+token limits. The catalog shows advertised USD rates per million tokens.
+For Ball Machine, look for both tool calling and image input. Click **Set up**
+to use a catalog model in a new profile. Saved profiles are available offline.
+
+### Build a team
+
+Open **Teams** and click **New team**. Give the team a name and add up to
+eight agents. Each one gets a name, a sprite, a letter or number to show on
+it, and a model profile. You can use the same profile for the whole team or
+give everyone a different one. On **Spectate**, pick your team under
+**Model or team**, then choose who plays in **Pick your squad**.
+
+The squad starts with the first available agents up to the puzzle's default
+size. Use **Squad size** to change the count within the displayed puzzle
+limits. Drag to reorder the squad, or drag a benched agent onto someone
+who's playing to swap them. You can also use the buttons. When you're
+ready, click **Run squad**. Word Jumble takes one agent, and Ball Machine
+takes two or more. Agents need a model profile with a saved API key to play.
+Set a round limit for the team if you like, or leave it blank to use the
+puzzle's default. The selected squad is saved with the recording.
+
+### From the terminal
 
 ### Gemini directly
 
@@ -122,28 +166,9 @@ key from an account without enforced plugin overrides, which can take
 precedence over those request settings.
 [OpenRouter plugin documentation](https://openrouter.ai/docs/guides/features/plugins/overview).
 
-### How I prefer to run it
-
-I set my API key in the terminal, configure the model I want to try, then
-open the viewer and start the run from there. For Gemini 3.8 Flash, I'd
-start with these settings.
-
-```sh
-./configure --backend gemini --model gemini-3.8-flash \
-  --gemini-input-tpm 1500000 --gemini-rpm 60
-python3 bench.py --serve
-```
-
-I open [the local viewer](http://127.0.0.1:8765), pick a puzzle, and set
-**Max rounds** if I want a different limit. Then I click **Run**. I can also pick a
-saved recording, which opens at the start, and click **Play**. When I want to
-try a different model, I stop the viewer with Ctrl+C, run `./configure` again,
-and restart it. Each configure command replaces `bench.json`. The runs and
-replays are saved separately under `runs/`.
-
-When I open the viewer in serve mode, I get a round-zero preview of the
-selected puzzle. If I leave the seed unset, the preview uses a sample seed
-and each new run draws its own seed.
+When the viewer starts in serve mode, it shows a round-zero preview of the
+selected puzzle. If the seed is unset, the preview uses a sample seed and
+each new run draws its own seed.
 
 ### Run settings and the viewer
 
@@ -154,10 +179,9 @@ runs. To save another set of settings alongside it, use `./configure
 Run `./configure --help` to see the available settings, including the maximum
 completion tokens per request.
 
-With a model configured and the key set, the viewer also has a **Run** button
-labelled with that model. It uses the saved settings for the selected puzzle.
-Set **Max rounds** before you launch to give the next run a different limit.
-Clear the field to go back to the configured model limit or the demo default.
+With a model configured and its key set in the shell, the viewer includes a
+**Terminal settings** option in the profile picker. Clear **Max rounds** to
+use the selected profile's limit, the terminal setting or the demo default.
 When you switch puzzles, the new puzzle's default agent count applies.
 Ball Machine is set up for five agents by default and needs at least two.
 Choose a model that accepts image inputs and can call tools. If you configure
@@ -204,7 +228,7 @@ under `runs/`. Start `python3 bench.py --serve` and choose a recording to see
 how the game started. Click **Play** to watch it unfold. Keep a copy of `runs/`
 if you want to move the recordings to another machine. The summary records the seed, backend, model,
 provider, elapsed time, time to solve and reported token counts. OpenRouter
-reports the cost in USD. For supported direct Gemini models, the viewer
+and xAI report the cost in USD. For supported direct Gemini models, the viewer
 estimates the cost in USD using the standard paid rates at the start of the
 run. This includes thinking tokens and discounts cached input when the
 recording has cache counts. Older recordings use the uncached rate for input

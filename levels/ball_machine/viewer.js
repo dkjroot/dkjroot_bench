@@ -133,7 +133,7 @@ function playerSprites(world) {
   return sprites;
 }
 
-function drawPlayers(ctx, world, {color, actor, focus, move, bubble}) {
+function drawPlayers(ctx, world, {color, actor, focus, move, bubble, character, pulse}) {
   const sprites = playerSprites(world);
   const previous = new Map(move ? playerSprites(move.world).map(sprite => [sprite.id, sprite]) : []);
   const active = id => id === actor || id === focus;
@@ -146,7 +146,8 @@ function drawPlayers(ctx, world, {color, actor, focus, move, bubble}) {
     const [px, py, cx, cy, scale] = ["px", "py", "cx", "cy", "scale"].map(key => mix(from[key], sprite[key], progress));
     const tint = color(id);
     if (px !== cx || py !== cy) line(ctx, [[cx, cy], [px, py]], tint + "88");
-    drawSprite(ctx, id, px, py, tint, {active: active(id), stride: id === actor ? progress : 0, scale});
+    drawSprite(ctx, id, px, py, tint, {active: active(id), stride: id === actor ? progress : 0, scale,
+      character: character?.(id), pulse: id === actor ? pulse : 0});
     if (bubble?.agent === id) speaker = [px, py - 27 * scale];
   }
   return speaker;

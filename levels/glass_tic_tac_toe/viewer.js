@@ -23,7 +23,7 @@ function glyph(ctx, mark, x, y, radius, color, width) {
   ctx.stroke();
 }
 
-export function drawWorld(canvas, world, {color, focus, sight, actor, move, bubble}) {
+export function drawWorld(canvas, world, {color, focus, sight, actor, move, bubble, character, pulse}) {
   const ctx = canvas.getContext("2d");
   const size = canvas.width;
   const inset = 29;
@@ -166,6 +166,7 @@ export function drawWorld(canvas, world, {color, focus, sight, actor, move, bubb
     }
     drawSprite(ctx, player.id, x, y, color(player.id), {
       active: actor === player.id, stride: actor === player.id ? move?.progress : 0,
+      character: character?.(player.id), pulse: actor === player.id ? pulse : 0,
     });
     if (bubble?.agent === player.id) speaker = [x, y - 26];
     if (player.carrying) {

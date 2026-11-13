@@ -7,9 +7,23 @@ from dojo.level import load_level
 MODEL_ID = re.compile(r"[A-Za-z0-9][\w.-]*/[A-Za-z0-9][\w.-]*(?::[\w.-]+)?", re.ASCII)
 MODEL_ROUTERS = {"openrouter/auto", "openrouter/free", "openrouter/pareto-code", "openrouter/fusion"}
 GEMINI_MODEL_ID = re.compile(r"gemini-[a-z0-9]+(?:[.-][a-z0-9]+)*")
-BACKEND_KEYS = {"openrouter": "OPENROUTER_API_KEY", "gemini": "GEMINI_API_KEY"}
+DIRECT_MODEL_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,255}")
+BACKEND_KEYS = {
+    "openrouter": "OPENROUTER_API_KEY", "gemini": "GEMINI_API_KEY", "openai": "OPENAI_API_KEY",
+    "anthropic": "ANTHROPIC_API_KEY", "xai": "XAI_API_KEY", "deepseek": "DEEPSEEK_API_KEY",
+}
+REASONING_BACKENDS = {"openrouter", "openai", "xai", "deepseek"}
 DEFAULT_DEMO_ROUNDS = 160
 MAX_ROUNDS = 1000
+MAX_AGENTS = 8
+TEAM = "team"
+
+
+def agent_limits(level):
+    fixed = getattr(level, "FIXED_AGENTS", None)
+    if fixed is not None:
+        return fixed, fixed
+    return getattr(level, "MIN_AGENTS", 1), min(getattr(level, "MAX_AGENTS", MAX_AGENTS), MAX_AGENTS)
 
 
 def validate_rounds(rounds):
@@ -45,24 +59,28 @@ class Settings:
             object.__setattr__(self, "rounds", rounds)
         validate_rounds(self.rounds)
         for name, lower, upper in (
-            ("agents", 1, 8),
+            ("agents", 1, MAX_AGENTS),
             ("max_completion_tokens", 1, 200_000), ("request_timeout", 1, 600),
         ):
             value = getattr(self, name)
             if type(value) is not int or not lower <= value <= upper:
                 raise ValueError(f"{name} must be an integer from {lower} to {upper}.")
-        fixed_agents = getattr(level, "FIXED_AGENTS", None)
-        if fixed_agents is not None and self.agents != fixed_agents:
-            raise ValueError(f"{level.TITLE} requires {fixed_agents} agent.")
-        minimum_agents = getattr(level, "MIN_AGENTS", 1)
+        minimum_agents, maximum_agents = agent_limits(level)
+        if minimum_agents == maximum_agents and self.agents != minimum_agents:
+            unit = "agent" if minimum_agents == 1 else "agents"
+            raise ValueError(f"{level.TITLE} requires {minimum_agents} {unit}.")
         if self.agents < minimum_agents:
             raise ValueError(f"{level.TITLE} requires at least {minimum_agents} agents.")
+        if self.agents > maximum_agents:
+            raise ValueError(f"{level.TITLE} allows at most {maximum_agents} agents.")
         if self.seed is not None and (type(self.seed) is not int or abs(self.seed) > 2**53 - 1):
             raise ValueError("seed must be an integer between -(2**53 - 1) and 2**53 - 1.")
         if type(self.demo_delay) not in (int, float) or not 0 <= self.demo_delay <= 5:
             raise ValueError("demo_delay must be a number from 0 to 5 seconds.")
-        if not isinstance(self.backend, str) or self.backend not in BACKEND_KEYS:
-            raise ValueError("backend must be openrouter or gemini.")
+        if self.backend == TEAM and self.model != TEAM:
+            raise ValueError("Team runs need a saved team profile.")
+        if not isinstance(self.backend, str) or (self.backend not in BACKEND_KEYS and self.backend != TEAM):
+            raise ValueError(f"backend must be one of {', '.join(BACKEND_KEYS)}.")
         for name in ("gemini_input_tpm", "gemini_rpm"):
             value = getattr(self, name)
             if value is not None and (self.backend != "gemini" or type(value) is not int or value < 1):
@@ -73,25 +91,34 @@ class Settings:
             if self.model != "demo" and (not isinstance(self.model, str)
                                          or not GEMINI_MODEL_ID.fullmatch(self.model)):
                 raise ValueError("model must be demo or a Gemini API model ID such as gemini-3.1-flash-lite.")
-            if self.provider is not None or self.reasoning_effort is not None:
-                raise ValueError("provider and reasoning_effort settings require the OpenRouter backend.")
-        elif self.model != "demo":
+        elif self.backend == "openrouter" and self.model != "demo":
             if not isinstance(self.model, str) or not MODEL_ID.fullmatch(self.model):
                 raise ValueError("model must be demo or a concrete OpenRouter model ID.")
             model, _, variant = self.model.lower().partition(":")
             if model in MODEL_ROUTERS or variant == "online":
                 raise ValueError("Choose one model without a router or the web search variant.")
-        if self.provider is not None and (not isinstance(self.provider, str)
-                                          or not self.provider.strip()):
-            raise ValueError("provider must be an OpenRouter provider slug.")
+        elif self.model != "demo" and (not isinstance(self.model, str) or not DIRECT_MODEL_ID.fullmatch(self.model)):
+            raise ValueError("Enter a model ID for the selected API.")
+        if self.provider is not None:
+            if self.backend != "openrouter":
+                raise ValueError("Provider settings require the OpenRouter backend.")
+            if not isinstance(self.provider, str) or not self.provider.strip():
+                raise ValueError("provider must be an OpenRouter provider slug.")
         if self.reasoning_effort not in (None, "none", "minimal", "low", "medium",
-                                         "high", "xhigh"):
+                                         "high", "xhigh", "max"):
             raise ValueError("Invalid reasoning_effort.")
+        if self.reasoning_effort is not None:
+            if self.backend not in REASONING_BACKENDS:
+                raise ValueError("This API does not support the reasoning effort setting.")
+            if self.backend == "deepseek" and self.reasoning_effort not in ("none", "low", "high", "max"):
+                raise ValueError("Choose default, none, low, high or max reasoning for DeepSeek.")
+            if self.backend != "deepseek" and self.reasoning_effort == "max":
+                raise ValueError("Max reasoning effort is available for DeepSeek.")
         if self.model == "demo" and not hasattr(level, "demo"):
             raise ValueError(f"{self.level} has no scripted demo.")
 
     def for_level(self, level, **changes):
-        agents = self.agents if self.level == level else None
+        agents = changes.pop("agents", self.agents if self.level == level else None)
         return replace(self, level=level, agents=agents, **changes)
 
     @classmethod
@@ -103,6 +130,8 @@ class Settings:
         unknown = data.keys() - {field.name for field in fields(cls)}
         if unknown:
             raise ValueError(f"Unknown settings: {', '.join(sorted(unknown))}")
+        if data.get("backend") == TEAM:
+            raise ValueError("Select a team in the viewer to launch it.")
         return cls(**data)
 
     def write(self, path):

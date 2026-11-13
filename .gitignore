@@ -12,4 +12,10 @@ venv/
 .DS_Store
 
 /bench.json
+/model-profiles.json
+/model-profiles.json.lock
+/.model-profiles-*
+/team-profiles.json
+/team-profiles.json.lock
+/.team-profiles-*
 /runs/

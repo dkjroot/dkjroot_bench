@@ -3,6 +3,7 @@ import os
 import re
 from datetime import datetime, timezone
 from pathlib import Path
+from tempfile import NamedTemporaryFile
 from uuid import uuid4
 
 RUN_ID = re.compile(r"[0-9]{8}T[0-9]{6}-[0-9a-f]{8}")
@@ -10,6 +11,20 @@ RUN_ID = re.compile(r"[0-9]{8}T[0-9]{6}-[0-9a-f]{8}")
 
 def now():
     return datetime.now(timezone.utc)
+
+
+def write_private_json(path, data):
+    temporary = None
+    try:
+        with NamedTemporaryFile(dir=path.parent, prefix="." + path.stem + "-", delete=False,
+                                mode="w", encoding="utf-8") as file:
+            temporary = Path(file.name)
+            json.dump(data, file, indent=2)
+            file.write("\n")
+        temporary.replace(path)
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
 
 
 class Record:
@@ -40,8 +55,8 @@ class Record:
         temporary.replace(self.directory / "checkpoint.json")
 
     @staticmethod
-    def acquire(directory):
-        lock = (directory / ".writer-lock").open("a+b")
+    def acquire(directory, name=".writer-lock"):
+        lock = (directory / name).open("a+b")
         try:
             if os.name == "nt":
                 from msvcrt import LK_NBLCK, locking

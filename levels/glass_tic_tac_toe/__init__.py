@@ -4,7 +4,7 @@ from functools import lru_cache
 from dojo.level import tool
 
 TITLE = "Glass Tic-Tac-Toe"
-VERSION = 5
+VERSION = 6
 GOAL = "Solve the puzzle."
 DEFAULT_AGENTS = 4
 MAX_CALLS_PER_TURN = 1

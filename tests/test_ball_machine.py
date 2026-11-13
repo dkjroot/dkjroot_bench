@@ -205,7 +205,8 @@ class BallMachineTests(unittest.TestCase):
                         and frame["round"] < summary["rounds"]}
             self.assertTrue(recorded)
             self.assertEqual(recorded, sent_images)
-            messages = {message["id"]: {"from": message["from"], "text": message["text"]}
+            messages = {message["id"]: {"from": message["from"], "from_name": run.characters[message["from"]]["name"],
+                                       "text": message["text"]}
                         for frame in saved for agent in frame["agents"] for message in agent["sent"]}
             delivered = {(agent, frame["round"]): [messages[id] for id in ids]
                          for frame in saved if frame["event"]["kind"] == "mail"

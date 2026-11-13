@@ -6,7 +6,7 @@ from .demo import demo
 from .observation import render_observation
 
 TITLE = "Ball Machine"
-VERSION = 3
+VERSION = 4
 GOAL = "Get 3 balls into the bin before the time runs out."
 DEFAULT_AGENTS = 5
 MIN_AGENTS = 2

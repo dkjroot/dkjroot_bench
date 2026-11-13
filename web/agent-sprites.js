@@ -1,6 +1,11 @@
 const ink = "#07111d";
 
-// Rocket, rover, diamond, dome, walker, glider, shield and twin pod.
+export const spriteNames = {
+  rocket: "Rocket", rover: "Rover", diamond: "Diamond", dome: "Dome",
+  walker: "Walker", glider: "Glider", shield: "Shield", "twin-pod": "Twin pod",
+};
+export const agentColors = ["#19daff", "#ffc02b", "#f875ee", "#adfa45", "#ff7355", "#91a7ff", "#fafaff", "#24e3ab"];
+const spriteIds = Object.keys(spriteNames);
 const silhouettes = [
   "M0 -24 9 -16 13 -5 13 7 18 13 18 19 8 14 5 21H-5L-8 14-18 19V13L-13 7V-5L-9 -16Z",
   "M-20 -9H-13V-16H13V-9H20V14L15 18H-15L-20 14Z",
@@ -23,8 +28,11 @@ const numbers = [
   ["111", "101", "111", "101", "111"],
 ];
 
-export function drawSprite(ctx, id, x, y, color, {active = false, stride = 0, scale = 1} = {}) {
+export function drawSprite(ctx, id, x, y, color,
+    {active = false, stride = 0, scale = 1, character, pulse = 0} = {}) {
   const index = Number(id) - 1;
+  const badge = character?.badge ?? id;
+  const sprite = silhouettes[spriteIds.indexOf(character?.sprite)] ?? silhouettes[index];
   ctx.save();
   ctx.translate(Math.round(x), Math.round(y));
   ctx.scale(scale, scale);
@@ -50,30 +58,39 @@ export function drawSprite(ctx, id, x, y, color, {active = false, stride = 0, sc
     ctx.stroke();
   }
 
-  ctx.translate(0, -Math.round(2 * Math.sin(stride * Math.PI)));
+  const hop = Math.sin(stride * Math.PI) * 2 + Math.sin(pulse * Math.PI) * 4;
+  ctx.translate(0, -Math.round(hop));
   ctx.lineJoin = "round";
   ctx.strokeStyle = ink;
   ctx.lineWidth = 4;
-  const body = silhouettes[index];
-  ctx.stroke(body);
+  ctx.stroke(sprite);
   ctx.fillStyle = color;
-  ctx.fill(body);
+  ctx.fill(sprite);
   ctx.fillStyle = ink;
   ctx.fillRect(-7, -11, 4, 3);
   ctx.fillRect(3, -11, 4, 3);
   ctx.fillRect(-8, -5, 16, 20);
   ctx.fillStyle = "#fff";
-  numbers[index].forEach((row, y) => {
-    for (let x = 0; x < row.length; x++) {
-      if (row[x] === "1") ctx.fillRect(-4 + x * 3, -2 + y * 3, 3, 3);
-    }
-  });
+  const pixels = numbers[Number(badge) - 1];
+  if (pixels) {
+    pixels.forEach((row, y) => {
+      for (let x = 0; x < row.length; x++) {
+        if (row[x] === "1") ctx.fillRect(-4 + x * 3, -2 + y * 3, 3, 3);
+      }
+    });
+  } else {
+    ctx.font = "bold 16px monospace";
+    ctx.textAlign = "center";
+    ctx.textBaseline = "middle";
+    ctx.fillText(badge, 0, 6, 13);
+  }
   ctx.restore();
 }
 
-export function drawAgent(canvas, id, color) {
+export function drawAgent(canvas, id, color, character) {
   const ctx = canvas.getContext("2d");
-  drawSprite(ctx, id, canvas.width / 2, canvas.height / 2, color);
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  drawSprite(ctx, id, canvas.width / 2, canvas.height / 2, color, {character});
 }
 
 export function drawBubble(ctx, x, y, bubble, color) {

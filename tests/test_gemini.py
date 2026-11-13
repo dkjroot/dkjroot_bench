@@ -87,7 +87,7 @@ class GeminiTests(unittest.TestCase):
                         identity, = contents[2]["parts"]
                         agent = identity["functionResponse"]["response"]["id"]
                         self.assertEqual(identity, {"functionResponse": {
-                            "name": "whoAmI", "response": {"id": agent},
+                            "name": "whoAmI", "response": {"id": agent, "name": {"1": "Ann", "2": "Ben"}[agent]},
                         }})
                         self.assertEqual(contents[1]["parts"], [
                             {"functionCall": {"name": "whoAmI"}, "thoughtSignature": "first"},

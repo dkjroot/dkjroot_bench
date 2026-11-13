@@ -125,6 +125,7 @@ def publish(root, public_root, run_id, destination, enabled):
             if comment:
                 (target / "comment.txt").write_text(comment + "\n", encoding="utf-8")
             summary.pop("resumable", None)
+            summary.pop("profile_name", None)
             summary_file = target / "summary.tmp"
             summary_file.write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
             summary_file.replace(target / "summary.json")
